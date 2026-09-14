@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Notebook shadow -->
+    <path
+        android:fillColor="#33000000"
+        android:pathData="M35 31 H75 C77 31, 79 33, 79 35 V79 C79 81, 77 83, 75 83 H35 C33 83, 31 81, 31 79 V35 C31 33, 33 31, 35 31 Z" />
+    <!-- Notebook main backing -->
+    <path
+        android:fillColor="#3E2723"
+        android:pathData="M34 29 H74 C76 29, 78 31, 78 33 V77 C78 79, 76 81, 74 81 H34 C32 81, 30 79, 30 77 V33 C30 31, 32 29, 34 29 Z" />
+    <!-- Paper page -->
+    <path
+        android:fillColor="#FFFDE7"
+        android:pathData="M38 31 H72 C73.5 31, 74.5 32, 74.5 33.5 V74.5 C74.5 76, 73.5 77, 72 77 H38 C36.5 77, 35.5 76, 35.5 74.5 V33.5 C35.5 32, 36.5 31, 38 31 Z" />
+    <!-- Notebook binder rings (left side) -->
+    <!-- Ring 1 -->
+    <path
+        android:fillColor="#795548"
+        android:pathData="M27 36 H33 C34 36, 35 37, 35 38 C35 39, 34 40, 33 40 H27 C26 40, 25 39, 25 38 C25 37, 26 36, 27 36 Z" />
+    <!-- Ring 2 -->
+    <path
+        android:fillColor="#795548"
+        android:pathData="M27 46 H33 C34 46, 35 47, 35 48 C35 49, 34 50, 33 50 H27 C26 50, 25 49, 25 48 C25 47, 26 46, 27 46 Z" />
+    <!-- Ring 3 -->
+    <path
+        android:fillColor="#795548"
+        android:pathData="M27 56 H33 C34 56, 35 57, 35 58 C35 59, 34 60, 33 60 H27 C26 60, 25 59, 25 58 C25 57, 26 56, 27 56 Z" />
+    <!-- Ring 4 -->
+    <path
+        android:fillColor="#795548"
+        android:pathData="M27 66 H33 C34 66, 35 67, 35 68 C35 69, 34 70, 33 70 H27 C26 70, 25 69, 25 68 C25 67, 26 66, 27 66 Z" />
+    <!-- Notebook lines -->
+    <path
+        android:fillColor="#D7CCC8"
+        android:pathData="M39 42 H68 V43.5 H39 Z" />
+    <path
+        android:fillColor="#D7CCC8"
+        android:pathData="M39 51 H68 V52.5 H39 Z" />
+    <path
+        android:fillColor="#D7CCC8"
+        android:pathData="M39 60 H68 V61.5 H39 Z" />
+    <path
+        android:fillColor="#D7CCC8"
+        android:pathData="M39 69 H60 V70.5 H39 Z" />
+    <!-- Small Pencil Drawing (Aesthetic overlap) -->
+    <path
+        android:fillColor="#FFC107"
+        android:pathData="M65 52 L73 44 L77 48 L69 56 Z" />
+    <path
+        android:fillColor="#D7CCC8"
+        android:pathData="M65 52 L63 54 L69 56 Z" />
+    <path
+        android:fillColor="#212121"
+        android:pathData="M63 54 L62 55 L64 55 Z" />
+    <path
+        android:fillColor="#E91E63"
+        android:pathData="M75 42 L77 44 L78 45 L76 47 Z" />
+</vector>
