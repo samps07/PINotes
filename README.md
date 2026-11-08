@@ -6,6 +6,9 @@ It supports everything from simple notes and checklists to tables, attachments, 
 
 ## ✨ Features
 
+<img width="1152" height="2560" alt="6305505422600770482" src="https://github.com/user-attachments/assets/747ed81b-6f34-4ffc-b299-dad09034fa51" />
+
+
 ### 📝 Notes
 
 - Create, edit, and delete notes
