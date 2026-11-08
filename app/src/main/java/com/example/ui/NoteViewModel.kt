@@ -12,6 +12,7 @@ import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 
 enum class SortOrder {
+    MANUAL,
     LAST_UPDATED,
     FIRST_UPDATED
 }
@@ -28,6 +29,15 @@ class NoteViewModel(val repository: NoteRepository, private val context: Context
     val excludedTags = MutableStateFlow<Set<String>>(emptySet())
     val selectedTagFilter = MutableStateFlow<String?>(null)
     val hiddenCategories = MutableStateFlow<Set<String>>(emptySet())
+    val sessionUnlockedCategories = MutableStateFlow<Set<String>>(emptySet())
+
+    fun unlockCategoryForSession(categoryName: String) {
+        sessionUnlockedCategories.value = sessionUnlockedCategories.value + categoryName
+    }
+
+    fun isCategoryUnlockedInSession(categoryName: String): Boolean {
+        return sessionUnlockedCategories.value.contains(categoryName)
+    }
 
     val allRawNotes: StateFlow<List<Note>> = repository.allNotes.stateIn(
         scope = viewModelScope,
@@ -42,8 +52,19 @@ class NoteViewModel(val repository: NoteRepository, private val context: Context
         incTags: Set<String>,
         excTags: Set<String>,
         hiddenCats: Set<String>,
+        sessionUnlocked: Set<String>,
         order: SortOrder
     ): List<Note> {
+        // If viewing a category that is locked and not unlocked in current session, immediately return empty list
+        if (category != null) {
+            val isLocked = hiddenCats.any { it.equals(category, ignoreCase = true) } &&
+                    com.example.data.CategoryPrefs.isPasscodeEnabled(context) &&
+                    sessionUnlocked.none { it.equals(category, ignoreCase = true) }
+            if (isLocked) {
+                return emptyList()
+            }
+        }
+
         val filtered = allNotes.filter { note ->
             val noteTags = note.tagList.map { it.trim().removePrefix("#").trim() }
             val matchesInc = incTags.isEmpty() || incTags.all { inc ->
@@ -60,13 +81,19 @@ class NoteViewModel(val repository: NoteRepository, private val context: Context
             if (category != null) {
                 note.category.equals(category, ignoreCase = true)
             } else {
-                !hiddenCats.contains(note.category)
+                hiddenCats.none { it.equals(note.category, ignoreCase = true) }
             }
         }
-        return if (order == SortOrder.LAST_UPDATED) {
-            filtered.sortedWith(compareByDescending<Note> { it.isPinned }.thenBy { it.position }.thenByDescending { it.timestamp })
-        } else {
-            filtered.sortedWith(compareByDescending<Note> { it.isPinned }.thenBy { it.position }.thenBy { it.timestamp })
+        return when (order) {
+            SortOrder.MANUAL -> {
+                filtered.sortedWith(compareByDescending<Note> { it.isPinned }.thenBy { it.position }.thenByDescending { it.timestamp })
+            }
+            SortOrder.LAST_UPDATED -> {
+                filtered.sortedWith(compareByDescending<Note> { it.isPinned }.thenByDescending { it.updatedAt }.thenByDescending { it.timestamp })
+            }
+            SortOrder.FIRST_UPDATED -> {
+                filtered.sortedWith(compareByDescending<Note> { it.isPinned }.thenBy { it.updatedAt }.thenBy { it.timestamp })
+            }
         }
     }
 
@@ -77,7 +104,8 @@ class NoteViewModel(val repository: NoteRepository, private val context: Context
         sortOrder,
         includedTags,
         excludedTags,
-        hiddenCategories
+        hiddenCategories,
+        sessionUnlockedCategories
     ) { flows ->
         @Suppress("UNCHECKED_CAST")
         val allNotes = flows[0] as List<Note>
@@ -93,8 +121,10 @@ class NoteViewModel(val repository: NoteRepository, private val context: Context
         val excTags = flows[5] as Set<String>
         @Suppress("UNCHECKED_CAST")
         val hiddenCats = flows[6] as Set<String>
+        @Suppress("UNCHECKED_CAST")
+        val sessionUnlocked = flows[7] as Set<String>
 
-        filterNotes(allNotes, category, query, incTags, excTags, hiddenCats, order)
+        filterNotes(allNotes, category, query, incTags, excTags, hiddenCats, sessionUnlocked, order)
     }.stateIn(
         scope = viewModelScope,
         started = SharingStarted.Eagerly,
@@ -297,6 +327,8 @@ class NoteViewModel(val repository: NoteRepository, private val context: Context
         isScheduled: Boolean = false,
         scheduledTime: Long? = null,
         repeatFrequency: String? = null,
+        repeatIntervalMinutes: Int? = null,
+        repeatUntilTime: Long? = null,
         tags: String? = null,
         autoTags: String? = null,
         attachmentUri: String? = null,
@@ -319,6 +351,8 @@ class NoteViewModel(val repository: NoteRepository, private val context: Context
                 isScheduled = isScheduled,
                 scheduledTime = scheduledTime,
                 repeatFrequency = repeatFrequency,
+                repeatIntervalMinutes = repeatIntervalMinutes,
+                repeatUntilTime = repeatUntilTime,
                 tags = tags,
                 autoTags = autoTags,
                 attachmentUri = attachmentUri,

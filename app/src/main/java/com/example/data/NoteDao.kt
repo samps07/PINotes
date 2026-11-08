@@ -8,6 +8,9 @@ interface NoteDao {
     @Query("SELECT * FROM notes WHERE deletedAt IS NULL ORDER BY isPinned DESC, position ASC, timestamp DESC")
     fun getAllNotes(): Flow<List<Note>>
 
+    @Query("SELECT * FROM notes WHERE deletedAt IS NULL AND isArchived = 0 ORDER BY isPinned DESC, position ASC, timestamp DESC")
+    fun getAllNotesSync(): List<Note>
+
     @Query("SELECT * FROM notes WHERE id = :id")
     suspend fun getNoteById(id: Int): Note?
 

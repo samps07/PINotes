@@ -87,6 +87,8 @@ data class FirebaseConfig(
 
                     if (config.storageBucket.isNotBlank()) {
                         builder.setStorageBucket(config.storageBucket)
+                    } else if (config.projectId.isNotBlank()) {
+                        builder.setStorageBucket("${config.projectId}.firebasestorage.app")
                     }
 
                     FirebaseApp.initializeApp(context.applicationContext, builder.build(), APP_NAME)

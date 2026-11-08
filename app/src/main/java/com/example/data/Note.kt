@@ -18,6 +18,8 @@ data class Note(
     val isScheduled: Boolean = false,
     val scheduledTime: Long? = null,
     val repeatFrequency: String? = null,
+    val repeatIntervalMinutes: Int? = null,
+    val repeatUntilTime: Long? = null,
     val position: Int = 0,
     val tags: String? = null,
     val autoTags: String? = null,
@@ -35,17 +37,33 @@ data class Note(
     val imageUris: List<String>
         get() {
             val list = mutableListOf<String>()
-            if (!imageUrl.isNullOrEmpty()) {
-                list.addAll(imageUrl.split("|").filter { it.trim().isNotEmpty() })
-            }
-            if (!imageUri.isNullOrEmpty()) {
-                val localUris = imageUri.split("|").filter { it.trim().isNotEmpty() }
-                for (local in localUris) {
+            val localList = if (!imageUri.isNullOrEmpty()) {
+                imageUri.split("|").map { it.trim() }.filter { it.isNotEmpty() }
+            } else emptyList()
+            val remoteList = if (!imageUrl.isNullOrEmpty()) {
+                imageUrl.split("|").map { it.trim() }.filter { it.isNotEmpty() }
+            } else emptyList()
+
+            val maxCount = maxOf(localList.size, remoteList.size)
+            for (i in 0 until maxCount) {
+                val local = localList.getOrNull(i)
+                val remote = remoteList.getOrNull(i)
+                if (local != null) {
                     if (local.startsWith("http://") || local.startsWith("https://")) {
-                        if (!list.contains(local)) list.add(local)
-                    } else {
                         list.add(local)
+                    } else {
+                        val path = if (local.startsWith("file://")) local.removePrefix("file://") else local
+                        val file = java.io.File(path)
+                        if (file.exists() && file.length() > 0) {
+                            list.add(local)
+                        } else if (!remote.isNullOrEmpty()) {
+                            list.add(remote)
+                        } else {
+                            list.add(local)
+                        }
                     }
+                } else if (!remote.isNullOrEmpty()) {
+                    list.add(remote)
                 }
             }
             return list.distinct()
@@ -187,6 +205,29 @@ fun serializeTaskItems(items: List<TaskItem>, sortCheckedToBottom: Boolean = fal
         val prefix = if (item.isChecked) "[x] " else "[ ] "
         "$prefix${item.text}"
     }
+}
+
+fun toggleTaskItemChecked(content: String, itemIndex: Int): String {
+    val tableData = parseTableListData(content)
+    if (itemIndex in tableData.items.indices) {
+        val updatedItems = tableData.items.toMutableList()
+        val current = updatedItems[itemIndex]
+        updatedItems[itemIndex] = current.copy(isChecked = !current.isChecked)
+        return serializeTableListData(tableData.copy(items = updatedItems))
+    }
+    return content
+}
+
+fun addTaskItemToContent(content: String, newText: String): String {
+    val tableData = parseTableListData(content)
+    val maxCols = maxOf(tableData.headers.size, 1)
+    val newCols = mutableListOf(newText)
+    while (newCols.size < maxCols) {
+        newCols.add("")
+    }
+    val updatedItems = tableData.items.toMutableList()
+    updatedItems.add(TableTaskItem(values = newCols, isChecked = false))
+    return serializeTableListData(tableData.copy(items = updatedItems))
 }
 
 fun formatNoteForCopying(note: Note): String {

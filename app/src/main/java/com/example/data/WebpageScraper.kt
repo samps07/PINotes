@@ -303,8 +303,8 @@ object WebpageScraper {
                                     extractedJson.optString("summary", fallbackMeta.summary)
                                 )
                                 var imageUrl = extractedJson.optString("imageUrl", fallbackMeta.imageUrl)
-                                val category = extractedJson.optString("category", null)
-                                val tags = extractedJson.optString("tags", null)
+                                val category = if (extractedJson.has("category") && !extractedJson.isNull("category")) extractedJson.getString("category") else null
+                                val tags = if (extractedJson.has("tags") && !extractedJson.isNull("tags")) extractedJson.getString("tags") else null
 
                                 if (imageUrl.isBlank()) {
                                     imageUrl = fallbackMeta.imageUrl

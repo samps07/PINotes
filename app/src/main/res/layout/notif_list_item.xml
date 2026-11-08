@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/item_root"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:orientation="horizontal"
+    android:gravity="center_vertical"
+    android:paddingVertical="4dp"
+    android:paddingHorizontal="4dp"
+    android:minHeight="36dp">
+
+    <ImageView
+        android:id="@+id/item_checkbox"
+        android:layout_width="28dp"
+        android:layout_height="28dp"
+        android:padding="2dp"
+        android:src="@drawable/ic_check_box_outline"
+        android:contentDescription="Toggle item checkbox" />
+
+    <TextView
+        android:id="@+id/item_text"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_weight="1"
+        android:layout_marginStart="8dp"
+        style="@style/TextAppearance.Compat.Notification.Line2"
+        android:textSize="14sp"
+        android:maxLines="2"
+        android:ellipsize="end" />
+</LinearLayout>

@@ -39,6 +39,7 @@ import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.lazy.staggeredgrid.LazyVerticalStaggeredGrid
 import androidx.compose.foundation.lazy.staggeredgrid.StaggeredGridCells
+import androidx.compose.foundation.lazy.staggeredgrid.StaggeredGridItemSpan
 import androidx.compose.foundation.lazy.staggeredgrid.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -60,6 +61,9 @@ import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardCapitalization
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.window.Dialog
@@ -113,12 +117,24 @@ class DynamicTextDelegate(
 }
 
 class MainActivity : ComponentActivity() {
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
 
         // Ensure notification channel is initialized for Android O+
         createNotificationChannel()
+
+        // Ensure notification permission on Android 13+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 101)
+            }
+        }
 
         // Local Room DB Setup
         val database = AppDatabase.getDatabase(this)
@@ -161,16 +177,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun createNotificationChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val descriptionText = "Channel for pushing individual notes as system notifications"
-            val importance = NotificationManager.IMPORTANCE_DEFAULT
-            val channel = NotificationChannel(CHANNEL_ID, CHANNEL_NAME, importance).apply {
-                description = descriptionText
-            }
-            val notificationManager: NotificationManager =
-                getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-            notificationManager.createNotificationChannel(channel)
-        }
+        MainActivity.createNotificationChannel(this)
     }
 
     fun pushNoteNotification(context: Context, note: Note) {
@@ -181,7 +188,22 @@ class MainActivity : ComponentActivity() {
         const val CHANNEL_ID = "notes_push_notifications"
         const val CHANNEL_NAME = "Note Notifications"
 
+        fun createNotificationChannel(context: Context) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                val descriptionText = "Channel for pushing individual notes as system notifications"
+                val importance = NotificationManager.IMPORTANCE_HIGH
+                val channel = NotificationChannel(CHANNEL_ID, CHANNEL_NAME, importance).apply {
+                    description = descriptionText
+                    enableLights(true)
+                    enableVibration(true)
+                }
+                val notificationManager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                notificationManager.createNotificationChannel(channel)
+            }
+        }
+
         fun companionPushNoteNotification(context: Context, note: Note) {
+            createNotificationChannel(context)
             kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
                 val intent = Intent(context, MainActivity::class.java).apply {
                     flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
@@ -208,37 +230,104 @@ class MainActivity : ComponentActivity() {
                     title = if (note.title.isEmpty()) "📎 $attachmentName" else "📎 [$attachmentName] - $title"
                 }
                 
-                // Format content text and rich big text representation based on isTaskList
+                // Format content text and rich representation based on isTaskList
                 val displayContent: String
-                val richBigText: String
-                if (note.isTaskList) {
-                    val items = com.example.data.parseTaskItems(note.content)
+                val isChecklist = note.isTaskList
+                val items = if (isChecklist) com.example.data.parseTaskItems(note.content) else emptyList()
+                if (isChecklist) {
                     val checkedCount = items.count { it.isChecked }
                     val totalCount = items.size
                     displayContent = "Progress: $checkedCount/$totalCount tasks completed"
-                    richBigText = items.mapIndexed { idx, item ->
-                        val statusSymbol = if (item.isChecked) "☑" else "☐"
-                        "${idx + 1}. $statusSymbol  ${item.text}"
-                    }.joinToString("\n")
                 } else {
                     displayContent = note.content
-                    richBigText = note.content
                 }
 
                 val builder = NotificationCompat.Builder(context, CHANNEL_ID)
                     .setSmallIcon(android.R.drawable.ic_menu_agenda)
                     .setContentTitle(title)
                     .setContentText(displayContent)
-                    .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+                    .setPriority(NotificationCompat.PRIORITY_HIGH)
+                    .setDefaults(NotificationCompat.DEFAULT_ALL)
                     .setContentIntent(pendingIntent)
                     .setAutoCancel(!note.isPersistentNotification)
                     .setOngoing(note.isPersistentNotification)
 
-                val bigTextStyle = NotificationCompat.BigTextStyle()
-                    .bigText(richBigText)
-                    .setBigContentTitle(title)
-                
-                builder.setStyle(bigTextStyle)
+                if (isChecklist) {
+                    val customExpandedView = android.widget.RemoteViews(context.packageName, R.layout.notif_custom_list)
+                    customExpandedView.removeAllViews(R.id.notif_items_container)
+
+                    val maxDisplayItems = 8
+                    val visibleItems = items.take(maxDisplayItems)
+
+                    if (visibleItems.isEmpty()) {
+                        val emptyItemView = android.widget.RemoteViews(context.packageName, R.layout.notif_list_item)
+                        emptyItemView.setTextViewText(R.id.item_text, "Checklist is empty")
+                        emptyItemView.setViewVisibility(R.id.item_checkbox, android.view.View.GONE)
+                        customExpandedView.addView(R.id.notif_items_container, emptyItemView)
+                    } else {
+                        visibleItems.forEachIndexed { index, item ->
+                            val itemView = android.widget.RemoteViews(context.packageName, R.layout.notif_list_item)
+                            if (item.isChecked) {
+                                itemView.setImageViewResource(R.id.item_checkbox, R.drawable.ic_check_box)
+                                val span = android.text.SpannableString(item.text)
+                                span.setSpan(android.text.style.StrikethroughSpan(), 0, span.length, android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+                                itemView.setTextViewText(R.id.item_text, span)
+                                itemView.setTextColor(R.id.item_text, 0xFF888888.toInt())
+                            } else {
+                                itemView.setImageViewResource(R.id.item_checkbox, R.drawable.ic_check_box_outline)
+                                itemView.setTextViewText(R.id.item_text, item.text)
+                            }
+
+                            val toggleIntent = Intent(context, NotificationActionReceiver::class.java).apply {
+                                action = "com.example.ACTION_TOGGLE_ITEM"
+                                data = Uri.parse("pinotes://toggle/${note.id}/$index")
+                                putExtra("note_id", note.id)
+                                putExtra("item_index", index)
+                            }
+                            val requestCode = note.id * 10000 + index
+                            val togglePendingIntent = PendingIntent.getBroadcast(
+                                context,
+                                requestCode,
+                                toggleIntent,
+                                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                            )
+                            itemView.setOnClickPendingIntent(R.id.item_checkbox, togglePendingIntent)
+                            itemView.setOnClickPendingIntent(R.id.item_root, togglePendingIntent)
+
+                            customExpandedView.addView(R.id.notif_items_container, itemView)
+                        }
+                    }
+
+                    if (items.size > maxDisplayItems) {
+                        customExpandedView.setViewVisibility(R.id.notif_more_text, android.view.View.VISIBLE)
+                        customExpandedView.setTextViewText(R.id.notif_more_text, "+${items.size - maxDisplayItems} more items (open in app)")
+                    } else {
+                        customExpandedView.setViewVisibility(R.id.notif_more_text, android.view.View.GONE)
+                    }
+
+                    builder.setCustomBigContentView(customExpandedView)
+                    builder.setStyle(NotificationCompat.DecoratedCustomViewStyle())
+                } else {
+                    val firstImage = note.imageUris.firstOrNull()
+                    if (!firstImage.isNullOrEmpty()) {
+                        val bitmap = kotlinx.coroutines.withTimeoutOrNull(1000L) {
+                            loadBitmapFromUri(context, firstImage)
+                        }
+                        if (bitmap != null) {
+                            val bigPictureStyle = NotificationCompat.BigPictureStyle()
+                                .bigPicture(bitmap)
+                                .bigLargeIcon(null as Bitmap?)
+                                .setBigContentTitle(title)
+                                .setSummaryText(displayContent)
+                            builder.setStyle(bigPictureStyle)
+                            builder.setLargeIcon(bitmap)
+                        } else {
+                            builder.setStyle(NotificationCompat.BigTextStyle().bigText(note.content).setBigContentTitle(title))
+                        }
+                    } else {
+                        builder.setStyle(NotificationCompat.BigTextStyle().bigText(note.content).setBigContentTitle(title))
+                    }
+                }
 
                 var actionsCount = 0
 
@@ -270,7 +359,8 @@ class MainActivity : ComponentActivity() {
                 }
 
                 // 1. Add text edit reply action (Highest priority, always added first)
-                val replyLabel = if (note.isTaskList) "Type item name or number to check, or add item" else "Edit note body"
+                val replyLabel = if (note.isTaskList) "Add item to checklist" else "Edit note body"
+                val replyActionTitle = if (note.isTaskList) "Add Item" else "Edit / Add"
                 val remoteInput = androidx.core.app.RemoteInput.Builder("key_note_reply")
                     .setLabel(replyLabel)
                     .build()
@@ -286,7 +376,7 @@ class MainActivity : ComponentActivity() {
                 )
                 val replyAction = NotificationCompat.Action.Builder(
                     android.R.drawable.ic_menu_edit,
-                    "Edit / Add",
+                    replyActionTitle,
                     replyActionPendingIntent
                 ).addRemoteInput(remoteInput).build()
                 builder.addAction(replyAction)
@@ -308,7 +398,7 @@ class MainActivity : ComponentActivity() {
                 builder.addAction(android.R.drawable.ic_menu_save, "Copy", copyPendingIntent)
                 actionsCount++
 
-                // 2. Add document/attachment direct open action button (Second priority)
+                // 3. Add document/attachment direct open action button (Second priority)
                 if (!note.attachmentUri.isNullOrEmpty() && actionsCount < 3) {
                     try {
                         val fileUri = Uri.parse(note.attachmentUri)
@@ -339,7 +429,7 @@ class MainActivity : ComponentActivity() {
                     }
                 }
 
-                // 3. Extract first available web URL and append a direct deep linking notification action (Third priority)
+                // 4. Extract first available web URL and append a direct deep linking notification action (Third priority)
                 val urlPattern = """(https?://[^\s$.?#].[^\s]*)""".toRegex()
                 val urlFind = urlPattern.find(note.content)
                 val extractedUrl = if (!note.webUrl.isNullOrEmpty()) note.webUrl else urlFind?.value
@@ -364,45 +454,6 @@ class MainActivity : ComponentActivity() {
                         actionsCount++
                     } catch (e: Exception) {
                         e.printStackTrace()
-                    }
-                }
-
-                // 4. Add interactive checklist action channels if space is still available
-                if (note.isTaskList) {
-                    val items = com.example.data.parseTaskItems(note.content)
-                    items.forEachIndexed { index, item ->
-                        if (actionsCount < 3) {
-                            val actionIntent = Intent(context, NotificationActionReceiver::class.java).apply {
-                                putExtra("note_id", note.id)
-                                putExtra("item_index", index)
-                            }
-                            val requestCode = note.id * 1000 + index
-                            val actionPendingIntent = PendingIntent.getBroadcast(
-                                context,
-                                requestCode,
-                                actionIntent,
-                                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-                            )
-                            val actionLabel = if (item.isChecked) "✗ ${item.text}" else "✓ ${item.text}"
-                            builder.addAction(0, actionLabel, actionPendingIntent)
-                            actionsCount++
-                        }
-                    }
-                }
-
-                val firstImage = note.imageUris.firstOrNull()
-                if (!firstImage.isNullOrEmpty()) {
-                    val bitmap = kotlinx.coroutines.withTimeoutOrNull(1000L) {
-                        loadBitmapFromUri(context, firstImage)
-                    }
-                    if (bitmap != null) {
-                        val bigPictureStyle = NotificationCompat.BigPictureStyle()
-                            .bigPicture(bitmap)
-                            .bigLargeIcon(null as Bitmap?)
-                            .setBigContentTitle(title)
-                            .setSummaryText(displayContent)
-                        builder.setStyle(bigPictureStyle)
-                        builder.setLargeIcon(bitmap)
                     }
                 }
 
@@ -553,6 +604,62 @@ class MainActivity : ComponentActivity() {
                 else -> "*/*"
             }
         }
+
+        fun handleNoteSchedulingOnSave(context: Context, note: com.example.data.Note, viewModel: com.example.ui.NoteViewModel) {
+            val now = System.currentTimeMillis()
+            if (note.isScheduled && note.scheduledTime != null) {
+                val freq = note.repeatFrequency?.lowercase() ?: "once"
+                val intervalMs = when (freq) {
+                    "minutes" -> (note.repeatIntervalMinutes ?: 15).coerceAtLeast(1) * 60 * 1000L
+                    "daily" -> 24 * 60 * 60 * 1000L
+                    "weekly" -> 7 * 24 * 60 * 60 * 1000L
+                    "monthly" -> 30 * 24 * 60 * 60 * 1000L
+                    else -> 0L
+                }
+
+                if (note.scheduledTime <= now) {
+                    // Immediate trigger requested
+                    MainActivity.companionPushNoteNotification(context, note)
+                    if (intervalMs > 0L) {
+                        var nextTrigger = note.scheduledTime + intervalMs
+                        while (nextTrigger <= now) {
+                            nextTrigger += intervalMs
+                        }
+                        val until = note.repeatUntilTime
+                        if (until == null || nextTrigger <= until) {
+                            val nextNote = note.copy(scheduledTime = nextTrigger, isScheduled = true)
+                            viewModel.updateNote(nextNote)
+                            NotificationScheduler.schedule(context, nextNote)
+                            val df = java.text.SimpleDateFormat("MMM dd, yyyy h:mm a", java.util.Locale.getDefault())
+                            android.widget.Toast.makeText(context, "Notification pushed! Next: ${df.format(java.util.Date(nextTrigger))}", android.widget.Toast.LENGTH_SHORT).show()
+                        } else {
+                            val doneNote = note.copy(isScheduled = false, scheduledTime = null)
+                            viewModel.updateNote(doneNote)
+                            NotificationScheduler.cancel(context, note.id)
+                        }
+                    } else {
+                        val doneNote = note.copy(isScheduled = false, scheduledTime = null)
+                        viewModel.updateNote(doneNote)
+                        NotificationScheduler.cancel(context, note.id)
+                        android.widget.Toast.makeText(context, "Notification pushed to shade", android.widget.Toast.LENGTH_SHORT).show()
+                    }
+                } else {
+                    // Future schedule: do not push to notification shade yet, schedule exact alarm
+                    androidx.core.app.NotificationManagerCompat.from(context).cancel(note.id)
+                    NotificationScheduler.schedule(context, note)
+                    val df = java.text.SimpleDateFormat("MMM dd, yyyy h:mm a", java.util.Locale.getDefault())
+                    android.widget.Toast.makeText(context, "Reminder scheduled for ${df.format(java.util.Date(note.scheduledTime))}", android.widget.Toast.LENGTH_SHORT).show()
+                }
+            } else {
+                NotificationScheduler.cancel(context, note.id)
+                if (note.isPersistentNotification) {
+                    MainActivity.companionPushNoteNotification(context, note)
+                    android.widget.Toast.makeText(context, "Persistent notification active in notification shade", android.widget.Toast.LENGTH_SHORT).show()
+                } else {
+                    androidx.core.app.NotificationManagerCompat.from(context).cancel(note.id)
+                }
+            }
+        }
     }
 }
 
@@ -593,11 +700,7 @@ fun MainScreen(
     val listState = rememberLazyListState()
     val gridState = rememberLazyStaggeredGridState()
 
-    LaunchedEffect(notes) {
-        if (draggedNoteId == null) {
-            localNotesList = notes
-        }
-    }
+    val displayNotes = if (draggedNoteId != null) localNotesList else notes
 
     var showEditorDialog by remember { mutableStateOf(false) }
     var activeNoteForEdit by remember { mutableStateOf<Note?>(null) }
@@ -607,14 +710,20 @@ fun MainScreen(
     LaunchedEffect(context, notes) {
         val activity = context as? MainActivity
         val intent = activity?.intent
-        if (intent != null && intent.hasExtra("open_note_id")) {
-            val noteId = intent.getIntExtra("open_note_id", -1)
-            if (noteId != -1) {
-                val targetNote = notes.find { it.id == noteId }
-                if (targetNote != null) {
-                    activeNoteForEdit = targetNote
-                    showEditorDialog = true
-                    intent.removeExtra("open_note_id")
+        if (intent != null) {
+            if (intent.getBooleanExtra("action_new_note", false)) {
+                activeNoteForEdit = null
+                showEditorDialog = true
+                intent.removeExtra("action_new_note")
+            } else if (intent.hasExtra("open_note_id")) {
+                val noteId = intent.getIntExtra("open_note_id", -1)
+                if (noteId != -1) {
+                    val targetNote = notes.find { it.id == noteId }
+                    if (targetNote != null) {
+                        activeNoteForEdit = targetNote
+                        showEditorDialog = true
+                        intent.removeExtra("open_note_id")
+                    }
                 }
             }
         }
@@ -629,6 +738,21 @@ fun MainScreen(
     var showQrDialog by remember { mutableStateOf(false) }
     var showImportBackupDialog by remember { mutableStateOf(false) }
     var showGoogleLoginDialog by remember { mutableStateOf(false) }
+    var showSetPasscodeDialog by remember { mutableStateOf(false) }
+    var showResetPasscodeDialog by remember { mutableStateOf(false) }
+    var showTurnOffPasscodeDialog by remember { mutableStateOf(false) }
+    var showUnlockPasscodeDialog by remember { mutableStateOf(false) }
+    var pendingUnlockCategory by remember { mutableStateOf<String?>(null) }
+    var passcodeVersion by remember { mutableIntStateOf(0) }
+    val sessionUnlockedCategories by viewModel.sessionUnlockedCategories.collectAsStateWithLifecycle()
+
+    val isPasscodeConfigured = remember(passcodeVersion) {
+        com.example.data.CategoryPrefs.isPasscodeEnabled(context) && !com.example.data.CategoryPrefs.getPasscode(context).isNullOrBlank()
+    }
+    val isCategoryLocked: (String?) -> Boolean = { cat ->
+        if (cat == null) false
+        else hiddenCategories.any { it.equals(cat, ignoreCase = true) } && isPasscodeConfigured && sessionUnlockedCategories.none { it.equals(cat, ignoreCase = true) }
+    }
 
     val sharedPrefs = remember { context.getSharedPreferences("app_settings", Context.MODE_PRIVATE) }
     var isLoggedIn by remember { mutableStateOf(sharedPrefs.getBoolean("is_logged_in", false)) }
@@ -646,8 +770,6 @@ fun MainScreen(
         }
     }
 
-    var isAlwaysCompact by remember { mutableStateOf(sharedPrefs.getBoolean("always_compact", false)) }
-
     val permissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission()
     ) { isGranted ->
@@ -661,6 +783,20 @@ fun MainScreen(
         }
         lastSelectedNoteToNotify = null
     }
+
+    LaunchedEffect(Unit) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (ContextCompat.checkSelfPermission(
+                    context,
+                    Manifest.permission.POST_NOTIFICATIONS
+                ) != PackageManager.PERMISSION_GRANTED
+            ) {
+                permissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+            }
+        }
+    }
+
+    var isAlwaysCompact by remember { mutableStateOf(sharedPrefs.getBoolean("always_compact", false)) }
 
     val onPushNotificationClick: (Note) -> Unit = { note ->
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -1001,230 +1137,322 @@ fun MainScreen(
             } // Close the main top Header Row
             }
 
-            // Horizontal scroll area with fixed Sort options toggle on the left
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(vertical = 4.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Spacer(modifier = Modifier.width(16.dp))
-                // Fixed Sort Toggle Button on the left
-                AppTooltip(text = "Sort Options") {
-                    Surface(
-                        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f),
-                        contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
-                        shape = RoundedCornerShape(16.dp),
-                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.2f)),
-                        modifier = Modifier
-                            .testTag("sort_filter_toggle_button")
-                            .clickable { showSortDialog = true }
-                    ) {
-                        Box(
-                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Icon(
-                                imageVector = Icons.Default.Sort,
-                                contentDescription = "Sort Notes",
-                                modifier = Modifier.size(18.dp),
-                                tint = MaterialTheme.colorScheme.primary
-                            )
-                        }
-                    }
-                }
+            // Active Tag Filters Bar state bindings
+            val activeIncTags by viewModel.includedTags.collectAsStateWithLifecycle()
+            val activeExcTags by viewModel.excludedTags.collectAsStateWithLifecycle()
 
-                // Horizontal Scrollable Category Filter Chips next to it
-                LazyRow(
-                    state = categoryChipsListState,
+            // Scrollable Category & Filter Chips component
+            val categoriesAndFiltersContent: @Composable () -> Unit = {
+                Column(
                     modifier = Modifier
-                        .weight(1f),
-                    contentPadding = PaddingValues(start = 10.dp, end = 20.dp),
-                    horizontalArrangement = Arrangement.spacedBy(10.dp),
-                    verticalAlignment = Alignment.CenterVertically
+                        .fillMaxWidth()
+                        .padding(bottom = 6.dp)
                 ) {
-                    // "All" filter chip
-                    item {
-                        InteractiveCategoryChip(
-                            text = "All Notes",
-                            isSelected = selectedCategory == null,
-                            onClick = { viewModel.setSelectedCategory(null) },
-                            onLongClick = { Toast.makeText(context, "Show all notes without any category filtering", Toast.LENGTH_SHORT).show() },
-                            leadingIcon = if (selectedCategory == null) {
-                                {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        // Fixed Sort Toggle Button on the left
+                        AppTooltip(text = "Sort Options") {
+                            Surface(
+                                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f),
+                                contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                                shape = RoundedCornerShape(16.dp),
+                                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.2f)),
+                                modifier = Modifier
+                                    .testTag("sort_filter_toggle_button")
+                                    .clickable { showSortDialog = true }
+                            ) {
+                                Box(
+                                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                                    contentAlignment = Alignment.Center
+                                ) {
                                     Icon(
-                                        imageVector = Icons.Default.Check,
-                                        contentDescription = null,
-                                        modifier = Modifier.size(16.dp)
+                                        imageVector = Icons.Default.Sort,
+                                        contentDescription = "Sort Notes",
+                                        modifier = Modifier.size(18.dp),
+                                        tint = MaterialTheme.colorScheme.primary
                                     )
                                 }
-                            } else null,
-                            testTag = "category_filter_chip_all"
-                        )
-                    }
+                            }
+                        }
 
-                    // Dedicated core category chips using custom InteractiveCategoryChip supporting long taps
-                    items(categoriesList) { category ->
-                        val isHiddenFromAll = hiddenCategories.contains(category)
-                        InteractiveCategoryChip(
-                            text = category,
-                            isSelected = selectedCategory == category,
-                            onClick = { viewModel.setSelectedCategory(category) },
-                            onLongClick = { 
-                                categoryToRearrange = category
-                                Toast.makeText(context, "Manage '$category' tag: Rename, hide, reorder, or delete.", Toast.LENGTH_SHORT).show()
-                            },
-                            leadingIcon = if (selectedCategory == category || isHiddenFromAll) {
-                                {
-                                    Row(
-                                        verticalAlignment = Alignment.CenterVertically,
-                                        horizontalArrangement = Arrangement.spacedBy(2.dp)
-                                    ) {
-                                        if (selectedCategory == category) {
+                        // Horizontal Scrollable Category Filter Chips next to it
+                        LazyRow(
+                            state = categoryChipsListState,
+                            modifier = Modifier.weight(1f),
+                            contentPadding = PaddingValues(start = 10.dp, end = 4.dp),
+                            horizontalArrangement = Arrangement.spacedBy(10.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            // "All" filter chip
+                            item {
+                                InteractiveCategoryChip(
+                                    text = "All Notes",
+                                    isSelected = selectedCategory == null,
+                                    onClick = { viewModel.setSelectedCategory(null) },
+                                    onLongClick = { Toast.makeText(context, "Show all notes without any category filtering", Toast.LENGTH_SHORT).show() },
+                                    leadingIcon = if (selectedCategory == null) {
+                                        {
                                             Icon(
                                                 imageVector = Icons.Default.Check,
                                                 contentDescription = null,
                                                 modifier = Modifier.size(16.dp)
                                             )
                                         }
-                                        if (isHiddenFromAll) {
+                                    } else null,
+                                    testTag = "category_filter_chip_all"
+                                )
+                            }
+
+                            // Dedicated core category chips using custom InteractiveCategoryChip supporting long taps
+                            items(categoriesList) { category ->
+                                val isHiddenFromAll = hiddenCategories.contains(category)
+                                val isLocked = isCategoryLocked(category)
+                                InteractiveCategoryChip(
+                                    text = category,
+                                    isSelected = selectedCategory == category,
+                                    onClick = { 
+                                        if (isLocked) {
+                                            pendingUnlockCategory = category
+                                            showUnlockPasscodeDialog = true
+                                        } else {
+                                            viewModel.setSelectedCategory(category)
+                                        }
+                                    },
+                                    onLongClick = { 
+                                        categoryToRearrange = category
+                                        Toast.makeText(context, "Manage '$category' tag: Rename, hide, reorder, or delete.", Toast.LENGTH_SHORT).show()
+                                    },
+                                    leadingIcon = if (selectedCategory == category || isHiddenFromAll) {
+                                        {
+                                            Row(
+                                                verticalAlignment = Alignment.CenterVertically,
+                                                horizontalArrangement = Arrangement.spacedBy(2.dp)
+                                            ) {
+                                                if (selectedCategory == category) {
+                                                    Icon(
+                                                        imageVector = Icons.Default.Check,
+                                                        contentDescription = null,
+                                                        modifier = Modifier.size(16.dp)
+                                                    )
+                                                }
+                                                if (isHiddenFromAll) {
+                                                    Icon(
+                                                        imageVector = if (isLocked) Icons.Default.Lock else Icons.Default.VisibilityOff,
+                                                        contentDescription = if (isLocked) "Locked Category" else "Hidden from All Notes",
+                                                        modifier = Modifier.size(14.dp),
+                                                        tint = if (isLocked) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f)
+                                                    )
+                                                }
+                                            }
+                                        }
+                                    } else null,
+                                    testTag = "category_filter_chip_$category"
+                                )
+                            }
+
+                            // Inline custom Category Tag Creator represented by an elegant Plus Icon Chip
+                            item {
+                                InteractiveCategoryChip(
+                                    text = "New Tag",
+                                    isSelected = false,
+                                    onClick = { showAddCategoryDialog = true },
+                                    onLongClick = { Toast.makeText(context, "Create a new custom category folder to organize notes", Toast.LENGTH_SHORT).show() },
+                                    leadingIcon = {
+                                        Icon(
+                                            imageVector = Icons.Default.Add,
+                                            contentDescription = "Add custom category tag",
+                                            modifier = Modifier.size(16.dp)
+                                        )
+                                    },
+                                    containerColor = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.5f),
+                                    contentColor = MaterialTheme.colorScheme.onPrimaryContainer,
+                                    borderColor = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.5f),
+                                    testTag = "category_filter_chip_add"
+                                )
+                            }
+                        }
+                    }
+
+                    // Active Tag Filters Bar
+                    if (activeIncTags.isNotEmpty() || activeExcTags.isNotEmpty()) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            Text(
+                                text = "Filtered tags:",
+                                style = MaterialTheme.typography.labelMedium,
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            androidx.compose.foundation.lazy.LazyRow(
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                items(activeIncTags.toList()) { tag ->
+                                    Surface(
+                                        shape = RoundedCornerShape(12.dp),
+                                        color = if (isSystemInDarkTheme()) Color(0xFF1E4620) else Color(0xFFD1E7DD),
+                                        border = BorderStroke(1.dp, if (isSystemInDarkTheme()) Color(0xFF86EFAC) else Color(0xFF0F5132)),
+                                        modifier = Modifier.clickable { viewModel.toggleTagFilter(tag) }
+                                    ) {
+                                        Row(
+                                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            horizontalArrangement = Arrangement.spacedBy(4.dp)
+                                        ) {
                                             Icon(
-                                                imageVector = Icons.Default.VisibilityOff,
-                                                contentDescription = "Hidden from All Notes",
-                                                modifier = Modifier.size(14.dp),
-                                                tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f)
+                                                imageVector = Icons.Default.Check,
+                                                contentDescription = "Included tag",
+                                                tint = if (isSystemInDarkTheme()) Color(0xFF86EFAC) else Color(0xFF0F5132),
+                                                modifier = Modifier.size(12.dp)
+                                            )
+                                            Text(
+                                                text = "#$tag",
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = if (isSystemInDarkTheme()) Color(0xFF86EFAC) else Color(0xFF0F5132),
+                                                fontWeight = FontWeight.Bold
                                             )
                                         }
                                     }
                                 }
-                            } else null,
-                            testTag = "category_filter_chip_$category"
-                        )
-                    }
-
-                    // Inline custom Category Tag Creator represented by an elegant Plus Icon Chip
-                    item {
-                        InteractiveCategoryChip(
-                            text = "New Tag",
-                            isSelected = false,
-                            onClick = { showAddCategoryDialog = true },
-                            onLongClick = { Toast.makeText(context, "Create a new custom category folder to organize notes", Toast.LENGTH_SHORT).show() },
-                            leadingIcon = {
+                                items(activeExcTags.toList()) { tag ->
+                                    Surface(
+                                        shape = RoundedCornerShape(12.dp),
+                                        color = if (isSystemInDarkTheme()) Color(0xFF4A1212) else Color(0xFFF8D7DA),
+                                        border = BorderStroke(1.dp, if (isSystemInDarkTheme()) Color(0xFFFCA5A5) else Color(0xFF842029)),
+                                        modifier = Modifier.clickable { viewModel.toggleTagFilter(tag) }
+                                    ) {
+                                        Row(
+                                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            horizontalArrangement = Arrangement.spacedBy(4.dp)
+                                        ) {
+                                            Icon(
+                                                imageVector = Icons.Default.Close,
+                                                contentDescription = "Excluded tag",
+                                                tint = if (isSystemInDarkTheme()) Color(0xFFFCA5A5) else Color(0xFF842029),
+                                                modifier = Modifier.size(12.dp)
+                                            )
+                                            Text(
+                                                text = "#$tag",
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = if (isSystemInDarkTheme()) Color(0xFFFCA5A5) else Color(0xFF842029),
+                                                fontWeight = FontWeight.Bold
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                            IconButton(
+                                onClick = { viewModel.clearTagFilters() },
+                                modifier = Modifier.size(24.dp)
+                            ) {
                                 Icon(
-                                    imageVector = Icons.Default.Add,
-                                    contentDescription = "Add custom category tag",
+                                    imageVector = Icons.Default.Close,
+                                    contentDescription = "Clear tag filters",
+                                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
                                     modifier = Modifier.size(16.dp)
                                 )
-                            },
-                            containerColor = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.5f),
-                            contentColor = MaterialTheme.colorScheme.onPrimaryContainer,
-                            borderColor = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.5f),
-                            testTag = "category_filter_chip_add"
-                        )
+                            }
+                        }
                     }
                 }
             }
 
-            // Active Tag Filters Bar
-            val activeIncTags by viewModel.includedTags.collectAsStateWithLifecycle()
-            val activeExcTags by viewModel.excludedTags.collectAsStateWithLifecycle()
-            if (activeIncTags.isNotEmpty() || activeExcTags.isNotEmpty()) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 16.dp, vertical = 4.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(6.dp)
-                ) {
-                    Text(
-                        text = "Filtered tags:",
-                        style = MaterialTheme.typography.labelMedium,
-                        fontWeight = FontWeight.Bold,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                    androidx.compose.foundation.lazy.LazyRow(
-                        horizontalArrangement = Arrangement.spacedBy(6.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        modifier = Modifier.weight(1f)
-                    ) {
-                        items(activeIncTags.toList()) { tag ->
-                            Surface(
-                                shape = RoundedCornerShape(12.dp),
-                                color = if (isSystemInDarkTheme()) Color(0xFF1E4620) else Color(0xFFD1E7DD),
-                                border = BorderStroke(1.dp, if (isSystemInDarkTheme()) Color(0xFF86EFAC) else Color(0xFF0F5132)),
-                                modifier = Modifier.clickable { viewModel.toggleTagFilter(tag) }
-                            ) {
-                                Row(
-                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(4.dp)
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.Default.Check,
-                                        contentDescription = "Included tag",
-                                        tint = if (isSystemInDarkTheme()) Color(0xFF86EFAC) else Color(0xFF0F5132),
-                                        modifier = Modifier.size(12.dp)
-                                    )
-                                    Text(
-                                        text = "#$tag",
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = if (isSystemInDarkTheme()) Color(0xFF86EFAC) else Color(0xFF0F5132),
-                                        fontWeight = FontWeight.Bold
-                                    )
-                                }
-                            }
-                        }
-                        items(activeExcTags.toList()) { tag ->
-                            Surface(
-                                shape = RoundedCornerShape(12.dp),
-                                color = if (isSystemInDarkTheme()) Color(0xFF4A1212) else Color(0xFFF8D7DA),
-                                border = BorderStroke(1.dp, if (isSystemInDarkTheme()) Color(0xFFFCA5A5) else Color(0xFF842029)),
-                                modifier = Modifier.clickable { viewModel.toggleTagFilter(tag) }
-                            ) {
-                                Row(
-                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(4.dp)
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.Default.Close,
-                                        contentDescription = "Excluded tag",
-                                        tint = if (isSystemInDarkTheme()) Color(0xFFFCA5A5) else Color(0xFF842029),
-                                        modifier = Modifier.size(12.dp)
-                                    )
-                                    Text(
-                                        text = "#$tag",
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = if (isSystemInDarkTheme()) Color(0xFFFCA5A5) else Color(0xFF842029),
-                                        fontWeight = FontWeight.Bold
-                                    )
-                                }
-                            }
-                        }
-                    }
-                    IconButton(
-                        onClick = { viewModel.clearTagFilters() },
-                        modifier = Modifier.size(24.dp)
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.Close,
-                            contentDescription = "Clear tag filters",
-                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.size(16.dp)
-                        )
-                    }
-                }
-            }
-
-            // Notes State Display (Empty or Filled List/Grid)
-            if (notes.isEmpty()) {
-                Box(
+            // Notes State Display (Locked Category, Empty, or Filled List/Grid)
+            if (isCategoryLocked(selectedCategory)) {
+                Column(
                     modifier = Modifier
                         .fillMaxWidth()
                         .weight(1f)
-                        .padding(20.dp),
-                    contentAlignment = Alignment.Center
                 ) {
+                    Box(modifier = Modifier.padding(horizontal = 16.dp)) {
+                        categoriesAndFiltersContent()
+                    }
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .weight(1f)
+                            .padding(24.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Column(
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.Center,
+                            modifier = Modifier.padding(16.dp)
+                        ) {
+                            Surface(
+                                modifier = Modifier.size(96.dp),
+                                shape = CircleShape,
+                                color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.5f)
+                            ) {
+                                Box(contentAlignment = Alignment.Center) {
+                                    Icon(
+                                        imageVector = Icons.Default.Lock,
+                                        contentDescription = "Category Locked",
+                                        modifier = Modifier.size(48.dp),
+                                        tint = MaterialTheme.colorScheme.primary
+                                    )
+                                }
+                            }
+                            Spacer(modifier = Modifier.height(20.dp))
+                            Text(
+                                text = "Category Locked",
+                                style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Bold),
+                                color = MaterialTheme.colorScheme.onBackground
+                            )
+                            Spacer(modifier = Modifier.height(10.dp))
+                            Text(
+                                text = "'$selectedCategory' is a hidden category protected with a passcode.",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.7f),
+                                textAlign = TextAlign.Center
+                            )
+                            Spacer(modifier = Modifier.height(20.dp))
+                            Button(
+                                onClick = {
+                                    pendingUnlockCategory = selectedCategory
+                                    showUnlockPasscodeDialog = true
+                                },
+                                shape = RoundedCornerShape(12.dp),
+                                modifier = Modifier.testTag("unlock_category_button")
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.LockOpen,
+                                    contentDescription = null,
+                                    modifier = Modifier.size(18.dp)
+                                )
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text("Unlock")
+                            }
+                        }
+                    }
+                }
+            } else if (notes.isEmpty()) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .weight(1f)
+                ) {
+                    Box(modifier = Modifier.padding(horizontal = 16.dp)) {
+                        categoriesAndFiltersContent()
+                    }
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .weight(1f)
+                            .padding(20.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
                     Column(
                         horizontalAlignment = Alignment.CenterHorizontally,
                         verticalArrangement = Arrangement.Center,
@@ -1263,7 +1491,8 @@ fun MainScreen(
                         )
                     }
                 }
-            } else {
+            }
+        } else {
                 Surface(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -1276,15 +1505,19 @@ fun MainScreen(
                             state = gridState,
                             columns = StaggeredGridCells.Fixed(2),
                             modifier = Modifier.fillMaxSize(),
-                            contentPadding = PaddingValues(start = 16.dp, end = 16.dp, bottom = 88.dp, top = 8.dp),
+                            contentPadding = PaddingValues(start = 16.dp, end = 16.dp, bottom = 88.dp, top = 4.dp),
                             horizontalArrangement = Arrangement.spacedBy(10.dp),
                             verticalItemSpacing = 10.dp
                         ) {
-                            items(localNotesList, key = { it.id }) { note ->
-                                val dragModifier = Modifier.pointerInput(note.id, localNotesList) {
+                            item(span = StaggeredGridItemSpan.FullLine, key = "header_categories_and_filters") {
+                                categoriesAndFiltersContent()
+                            }
+                            items(displayNotes, key = { it.id }) { note ->
+                                val dragModifier = Modifier.pointerInput(note.id, displayNotes) {
                                     detectDragGesturesAfterLongPress(
                                         onDragStart = { offset ->
                                             draggedNoteId = note.id
+                                            localNotesList = displayNotes.toMutableList()
                                             dragOffsetAccumulated = androidx.compose.ui.geometry.Offset.Zero
                                             selectedNoteIds = selectedNoteIds + note.id
                                         },
@@ -1325,6 +1558,8 @@ fun MainScreen(
                                                                 localNotesList = newList
                                                                 dragOffsetAccumulated = androidx.compose.ui.geometry.Offset.Zero
                                                                 viewModel.updateNotePositions(newList)
+                                                                viewModel.sortOrder.value = com.example.ui.SortOrder.MANUAL
+                                                                com.example.widget.NotesWidgetProvider.updateAllWidgets(context)
                                                             }
                                                         }
                                                     }
@@ -1377,14 +1612,18 @@ fun MainScreen(
                         androidx.compose.foundation.lazy.LazyColumn(
                             state = listState,
                             modifier = Modifier.fillMaxSize(),
-                            contentPadding = PaddingValues(start = 16.dp, end = 16.dp, bottom = 88.dp, top = 8.dp),
+                            contentPadding = PaddingValues(start = 16.dp, end = 16.dp, bottom = 88.dp, top = 4.dp),
                             verticalArrangement = Arrangement.spacedBy(10.dp)
                         ) {
-                            items(localNotesList, key = { it.id }) { note ->
-                                val dragModifier = Modifier.pointerInput(note.id, localNotesList) {
+                            item(key = "header_categories_and_filters") {
+                                categoriesAndFiltersContent()
+                            }
+                            items(displayNotes, key = { it.id }) { note ->
+                                val dragModifier = Modifier.pointerInput(note.id, displayNotes) {
                                     detectDragGesturesAfterLongPress(
                                         onDragStart = { offset ->
                                             draggedNoteId = note.id
+                                            localNotesList = displayNotes.toMutableList()
                                             dragOffsetAccumulated = androidx.compose.ui.geometry.Offset.Zero
                                             selectedNoteIds = selectedNoteIds + note.id
                                         },
@@ -1422,6 +1661,8 @@ fun MainScreen(
                                                                 localNotesList = newList
                                                                 dragOffsetAccumulated = androidx.compose.ui.geometry.Offset.Zero
                                                                 viewModel.updateNotePositions(newList)
+                                                                viewModel.sortOrder.value = com.example.ui.SortOrder.MANUAL
+                                                                com.example.widget.NotesWidgetProvider.updateAllWidgets(context)
                                                             }
                                                         }
                                                     }
@@ -1507,7 +1748,7 @@ fun MainScreen(
                 categories = categoriesList,
                 onDismiss = { showEditorDialog = false },
                 onImageClick = { fullScreenImageUri = it },
-                onAutoSave = { title, content, cat, colIdx, pinned, imgUri, isTaskList, webUrl, isScheduled, scheduledTime, repeatFreq, tags, autoT, attachUri, imageUrl, imageStoragePath, isPersistent, isAi ->
+                onAutoSave = { title, content, cat, colIdx, pinned, imgUri, isTaskList, webUrl, isScheduled, scheduledTime, repeatFreq, repeatIntervalMinutes, repeatUntilTime, tags, autoT, attachUri, imageUrl, imageStoragePath, isPersistent, isAi ->
                     if (activeNoteForEdit != null) {
                         val updatedNote = activeNoteForEdit!!.copy(
                             title = title,
@@ -1521,6 +1762,8 @@ fun MainScreen(
                             isScheduled = isScheduled,
                             scheduledTime = scheduledTime,
                             repeatFrequency = repeatFreq,
+                            repeatIntervalMinutes = repeatIntervalMinutes,
+                            repeatUntilTime = repeatUntilTime,
                             tags = tags,
                             autoTags = autoT,
                             attachmentUri = attachUri,
@@ -1532,7 +1775,7 @@ fun MainScreen(
                         activeNoteForEdit = updatedNote
                     }
                 },
-                onSave = { title, content, cat, colIdx, pinned, imgUri, isTaskList, webUrl, isScheduled, scheduledTime, repeatFreq, tags, autoT, attachUri, imageUrl, imageStoragePath, isPersistent, isAi ->
+                onSave = { title, content, cat, colIdx, pinned, imgUri, isTaskList, webUrl, isScheduled, scheduledTime, repeatFreq, repeatIntervalMinutes, repeatUntilTime, tags, autoT, attachUri, imageUrl, imageStoragePath, isPersistent, isAi ->
                     if (activeNoteForEdit == null) {
                         viewModel.insertNote(
                             title = title,
@@ -1546,6 +1789,8 @@ fun MainScreen(
                             isScheduled = isScheduled,
                             scheduledTime = scheduledTime,
                             repeatFrequency = repeatFreq,
+                            repeatIntervalMinutes = repeatIntervalMinutes,
+                            repeatUntilTime = repeatUntilTime,
                             tags = tags,
                             autoTags = autoT,
                             attachmentUri = attachUri,
@@ -1557,21 +1802,85 @@ fun MainScreen(
                             if (isAi && !webUrl.isNullOrEmpty() && !isMap) {
                                 com.example.data.BackgroundCurationManager.startCuration(context, insertedNote.id, webUrl)
                             }
-                            if (insertedNote.isPersistentNotification) {
-                                MainActivity.companionPushNoteNotification(context, insertedNote)
-                            }
-                            if (isScheduled && scheduledTime != null) {
-                                if (scheduledTime <= System.currentTimeMillis()) {
-                                    if (!insertedNote.isPersistentNotification) {
-                                        MainActivity.companionPushNoteNotification(context, insertedNote)
+
+                            val now = System.currentTimeMillis()
+                            var targetSchedTime = insertedNote.scheduledTime
+                            if (insertedNote.isScheduled && targetSchedTime != null) {
+                                val isImmediateMode = (targetSchedTime - now) <= 5000L
+                                val freq = insertedNote.repeatFrequency?.lowercase() ?: "once"
+                                val isRecurring = freq in listOf("minutes", "daily", "weekly", "monthly")
+
+                                if (isImmediateMode) {
+                                    MainActivity.companionPushNoteNotification(context, insertedNote)
+                                    Toast.makeText(context, "Note pushed to notifications!", Toast.LENGTH_SHORT).show()
+                                    if (isRecurring) {
+                                        val intervalMs = if (freq == "minutes") {
+                                            (insertedNote.repeatIntervalMinutes ?: 15).coerceAtLeast(1) * 60 * 1000L
+                                        } else when (freq) {
+                                            "daily" -> 24 * 60 * 60 * 1000L
+                                            "weekly" -> 7 * 24 * 60 * 60 * 1000L
+                                            "monthly" -> 30 * 24 * 60 * 60 * 1000L
+                                            else -> 0L
+                                        }
+                                        val nextTrigger = now + intervalMs
+                                        val untilTime = insertedNote.repeatUntilTime
+                                        if (untilTime == null || nextTrigger <= untilTime) {
+                                            val nextNote = insertedNote.copy(scheduledTime = nextTrigger)
+                                            viewModel.updateNote(nextNote)
+                                            NotificationScheduler.schedule(context, nextNote)
+                                            val formatted = java.text.SimpleDateFormat("MMM dd, h:mm a", java.util.Locale.getDefault()).format(java.util.Date(nextTrigger))
+                                            Toast.makeText(context, "Next reminder scheduled for $formatted", Toast.LENGTH_SHORT).show()
+                                        }
                                     }
                                 } else {
-                                    NotificationScheduler.schedule(context, insertedNote)
+                                    if (targetSchedTime <= now) {
+                                        if (freq == "minutes") {
+                                            val intervalMs = (insertedNote.repeatIntervalMinutes ?: 15).coerceAtLeast(1) * 60 * 1000L
+                                            while (targetSchedTime != null && targetSchedTime <= now) {
+                                                targetSchedTime += intervalMs
+                                            }
+                                        } else if (freq in listOf("daily", "weekly", "monthly")) {
+                                            val interval = when (freq) {
+                                                "daily" -> 24 * 60 * 60 * 1000L
+                                                "weekly" -> 7 * 24 * 60 * 60 * 1000L
+                                                "monthly" -> 30 * 24 * 60 * 60 * 1000L
+                                                else -> 0L
+                                            }
+                                            if (interval > 0L) {
+                                                while (targetSchedTime != null && targetSchedTime <= now) {
+                                                    targetSchedTime += interval
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    val finalSchedNote = if (targetSchedTime != insertedNote.scheduledTime) {
+                                        insertedNote.copy(scheduledTime = targetSchedTime).also { viewModel.updateNote(it) }
+                                    } else {
+                                        insertedNote
+                                    }
+
+                                    if (targetSchedTime != null && targetSchedTime > now) {
+                                        androidx.core.app.NotificationManagerCompat.from(context).cancel(finalSchedNote.id)
+                                        NotificationScheduler.schedule(context, finalSchedNote)
+                                        val formatted = java.text.SimpleDateFormat("MMM dd, yyyy h:mm a", java.util.Locale.getDefault()).format(java.util.Date(targetSchedTime))
+                                        Toast.makeText(context, "Reminder scheduled for $formatted", Toast.LENGTH_SHORT).show()
+                                    } else {
+                                        if (finalSchedNote.isPersistentNotification) {
+                                            MainActivity.companionPushNoteNotification(context, finalSchedNote)
+                                        }
+                                    }
                                 }
-                                Toast.makeText(context, "Note notification scheduled successfully", Toast.LENGTH_SHORT).show()
-                            } else if (insertedNote.isPersistentNotification) {
-                                Toast.makeText(context, "Persistent notification active in notification shade", Toast.LENGTH_SHORT).show()
+                            } else {
+                                NotificationScheduler.cancel(context, insertedNote.id)
+                                if (insertedNote.isPersistentNotification) {
+                                    MainActivity.companionPushNoteNotification(context, insertedNote)
+                                    Toast.makeText(context, "Persistent notification active in notification shade", Toast.LENGTH_SHORT).show()
+                                } else {
+                                    androidx.core.app.NotificationManagerCompat.from(context).cancel(insertedNote.id)
+                                }
                             }
+                            com.example.widget.NotesWidgetProvider.updateAllWidgets(context)
                         }
                     } else {
                         val updatedNote = activeNoteForEdit!!.copy(
@@ -1586,6 +1895,8 @@ fun MainScreen(
                             isScheduled = isScheduled,
                             scheduledTime = scheduledTime,
                             repeatFrequency = repeatFreq,
+                            repeatIntervalMinutes = repeatIntervalMinutes,
+                            repeatUntilTime = repeatUntilTime,
                             tags = tags,
                             autoTags = autoT,
                             attachmentUri = attachUri,
@@ -1598,25 +1909,85 @@ fun MainScreen(
                         if (isAi && !webUrl.isNullOrEmpty() && !isMap) {
                             com.example.data.BackgroundCurationManager.startCuration(context, updatedNote.id, webUrl)
                         }
-                        if (updatedNote.isPersistentNotification) {
-                            MainActivity.companionPushNoteNotification(context, updatedNote)
+
+                        val now = System.currentTimeMillis()
+                        var targetSchedTime = updatedNote.scheduledTime
+                        if (updatedNote.isScheduled && targetSchedTime != null) {
+                            val isImmediateMode = (targetSchedTime - now) <= 5000L
+                            val freq = updatedNote.repeatFrequency?.lowercase() ?: "once"
+                            val isRecurring = freq in listOf("minutes", "daily", "weekly", "monthly")
+
+                            if (isImmediateMode) {
+                                MainActivity.companionPushNoteNotification(context, updatedNote)
+                                Toast.makeText(context, "Note pushed to notifications!", Toast.LENGTH_SHORT).show()
+                                if (isRecurring) {
+                                    val intervalMs = if (freq == "minutes") {
+                                        (updatedNote.repeatIntervalMinutes ?: 15).coerceAtLeast(1) * 60 * 1000L
+                                    } else when (freq) {
+                                        "daily" -> 24 * 60 * 60 * 1000L
+                                        "weekly" -> 7 * 24 * 60 * 60 * 1000L
+                                        "monthly" -> 30 * 24 * 60 * 60 * 1000L
+                                        else -> 0L
+                                    }
+                                    val nextTrigger = now + intervalMs
+                                    val untilTime = updatedNote.repeatUntilTime
+                                    if (untilTime == null || nextTrigger <= untilTime) {
+                                        val nextNote = updatedNote.copy(scheduledTime = nextTrigger)
+                                        viewModel.updateNote(nextNote)
+                                        NotificationScheduler.schedule(context, nextNote)
+                                        val formatted = java.text.SimpleDateFormat("MMM dd, h:mm a", java.util.Locale.getDefault()).format(java.util.Date(nextTrigger))
+                                        Toast.makeText(context, "Next reminder scheduled for $formatted", Toast.LENGTH_SHORT).show()
+                                    }
+                                }
+                            } else {
+                                if (targetSchedTime <= now) {
+                                    if (freq == "minutes") {
+                                        val intervalMs = (updatedNote.repeatIntervalMinutes ?: 15).coerceAtLeast(1) * 60 * 1000L
+                                        while (targetSchedTime != null && targetSchedTime <= now) {
+                                            targetSchedTime += intervalMs
+                                        }
+                                    } else if (freq in listOf("daily", "weekly", "monthly")) {
+                                        val interval = when (freq) {
+                                            "daily" -> 24 * 60 * 60 * 1000L
+                                            "weekly" -> 7 * 24 * 60 * 60 * 1000L
+                                            "monthly" -> 30 * 24 * 60 * 60 * 1000L
+                                            else -> 0L
+                                        }
+                                        if (interval > 0L) {
+                                            while (targetSchedTime != null && targetSchedTime <= now) {
+                                                targetSchedTime += interval
+                                            }
+                                        }
+                                    }
+                                }
+
+                                val finalSchedNote = if (targetSchedTime != updatedNote.scheduledTime) {
+                                    updatedNote.copy(scheduledTime = targetSchedTime).also { viewModel.updateNote(it) }
+                                } else {
+                                    updatedNote
+                                }
+
+                                if (targetSchedTime != null && targetSchedTime > now) {
+                                    androidx.core.app.NotificationManagerCompat.from(context).cancel(finalSchedNote.id)
+                                    NotificationScheduler.schedule(context, finalSchedNote)
+                                    val formatted = java.text.SimpleDateFormat("MMM dd, yyyy h:mm a", java.util.Locale.getDefault()).format(java.util.Date(targetSchedTime))
+                                    Toast.makeText(context, "Reminder scheduled for $formatted", Toast.LENGTH_SHORT).show()
+                                } else {
+                                    if (finalSchedNote.isPersistentNotification) {
+                                        MainActivity.companionPushNoteNotification(context, finalSchedNote)
+                                    }
+                                }
+                            }
                         } else {
-                            if (!isScheduled) {
+                            NotificationScheduler.cancel(context, updatedNote.id)
+                            if (updatedNote.isPersistentNotification) {
+                                MainActivity.companionPushNoteNotification(context, updatedNote)
+                                Toast.makeText(context, "Persistent notification active in notification shade", Toast.LENGTH_SHORT).show()
+                            } else {
                                 androidx.core.app.NotificationManagerCompat.from(context).cancel(updatedNote.id)
                             }
                         }
-                        if (isScheduled && scheduledTime != null) {
-                            if (scheduledTime <= System.currentTimeMillis()) {
-                                if (!updatedNote.isPersistentNotification) {
-                                    MainActivity.companionPushNoteNotification(context, updatedNote)
-                                }
-                            } else {
-                                NotificationScheduler.schedule(context, updatedNote)
-                            }
-                            Toast.makeText(context, "Note notification scheduled successfully", Toast.LENGTH_SHORT).show()
-                        } else {
-                            NotificationScheduler.cancel(context, updatedNote.id)
-                        }
+                        com.example.widget.NotesWidgetProvider.updateAllWidgets(context)
                     }
                     showEditorDialog = false
                 }
@@ -1634,7 +2005,12 @@ fun MainScreen(
                         modifier = Modifier.testTag("confirm_delete_button"),
                         colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
                         onClick = {
-                            noteToDelete?.let { viewModel.deleteNote(it) }
+                            noteToDelete?.let {
+                                NotificationScheduler.cancel(context, it.id)
+                                androidx.core.app.NotificationManagerCompat.from(context).cancel(it.id)
+                                viewModel.deleteNote(it)
+                                com.example.widget.NotesWidgetProvider.updateAllWidgets(context)
+                            }
                             noteToDelete = null
                         }
                     ) {
@@ -1662,6 +2038,30 @@ fun MainScreen(
                         modifier = Modifier.fillMaxWidth(),
                         verticalArrangement = Arrangement.spacedBy(12.dp)
                     ) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable {
+                                    viewModel.sortOrder.value = com.example.ui.SortOrder.MANUAL
+                                    showSortDialog = false
+                                }
+                                .padding(vertical = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            RadioButton(
+                                selected = currentSort == com.example.ui.SortOrder.MANUAL,
+                                onClick = {
+                                    viewModel.sortOrder.value = com.example.ui.SortOrder.MANUAL
+                                    showSortDialog = false
+                                }
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text(
+                                text = "Manual (Custom Drag-and-Drop)",
+                                style = MaterialTheme.typography.bodyLarge
+                            )
+                        }
+
                         Row(
                             modifier = Modifier
                                 .fillMaxWidth()
@@ -1719,8 +2119,8 @@ fun MainScreen(
 
                         Spacer(modifier = Modifier.height(4.dp))
 
-                        val allTags = remember(localNotesList) {
-                            localNotesList.flatMap { it.tagList }
+                        val allTags = remember(displayNotes) {
+                            displayNotes.flatMap { it.tagList }
                                 .map { it.trim().removePrefix("#").trim() }
                                 .filter { it.isNotEmpty() }
                                 .toSet()
@@ -1877,9 +2277,9 @@ fun MainScreen(
                                     val colorIndex = obj.optInt("colorIndex", 0)
                                     val isPinned = obj.optBoolean("isPinned", false)
                                     val isTaskList = obj.optBoolean("isTaskList", false)
-                                    val webUrl = obj.optString("webUrl", null)
-                                    val tags = obj.optString("tags", null)
-                                    val autoTags = obj.optString("autoTags", null)
+                                    val webUrl = if (obj.has("webUrl") && !obj.isNull("webUrl")) obj.getString("webUrl") else null
+                                    val tags = if (obj.has("tags") && !obj.isNull("tags")) obj.getString("tags") else null
+                                    val autoTags = if (obj.has("autoTags") && !obj.isNull("autoTags")) obj.getString("autoTags") else null
 
                                     viewModel.insertNote(
                                         title = title,
@@ -2499,6 +2899,184 @@ fun MainScreen(
                         modifier = Modifier.fillMaxWidth().verticalScroll(rememberScrollState()),
                         verticalArrangement = Arrangement.spacedBy(16.dp)
                     ) {
+                        // Expandable Category Lock / Passcode Protection Dropdown Section
+                        var isCategoryLockExpanded by remember { mutableStateOf(false) }
+                        val isPasscodeActiveNow = remember(passcodeVersion) {
+                            com.example.data.CategoryPrefs.isPasscodeEnabled(context)
+                        }
+                        val hasExistingPasscodeNow = remember(passcodeVersion) {
+                            !com.example.data.CategoryPrefs.getPasscode(context).isNullOrBlank()
+                        }
+
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .background(
+                                    MaterialTheme.colorScheme.surfaceVariant.copy(alpha = if (isCategoryLockExpanded) 0.3f else 0.15f),
+                                    RoundedCornerShape(12.dp)
+                                )
+                                .border(
+                                    1.dp,
+                                    MaterialTheme.colorScheme.outline.copy(alpha = if (isCategoryLockExpanded) 0.25f else 0.12f),
+                                    RoundedCornerShape(12.dp)
+                                )
+                                .clickable { isCategoryLockExpanded = !isCategoryLockExpanded }
+                                .padding(12.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Row(
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.Lock,
+                                        contentDescription = null,
+                                        tint = MaterialTheme.colorScheme.primary,
+                                        modifier = Modifier.size(20.dp)
+                                    )
+                                    Text(
+                                        text = "Category Lock / Passcode",
+                                        style = MaterialTheme.typography.titleSmall,
+                                        fontWeight = FontWeight.Bold,
+                                        color = MaterialTheme.colorScheme.onSurface
+                                    )
+                                }
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                ) {
+                                    Surface(
+                                        shape = RoundedCornerShape(8.dp),
+                                        color = if (isPasscodeActiveNow && hasExistingPasscodeNow) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)
+                                    ) {
+                                        Text(
+                                            text = if (isPasscodeActiveNow && hasExistingPasscodeNow) "Active" else "Off",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = if (isPasscodeActiveNow && hasExistingPasscodeNow) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurfaceVariant,
+                                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+                                            fontWeight = FontWeight.Bold
+                                        )
+                                    }
+                                    Icon(
+                                        imageVector = if (isCategoryLockExpanded) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
+                                        contentDescription = if (isCategoryLockExpanded) "Collapse" else "Expand",
+                                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        modifier = Modifier.size(20.dp)
+                                    )
+                                }
+                            }
+
+                            if (isCategoryLockExpanded) {
+                                Spacer(modifier = Modifier.height(10.dp))
+                                Column(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                                ) {
+                                    Text(
+                                        text = "Protect hidden categories with an optional passcode. When enabled, accessing a hidden category requires entering your passcode. Once unlocked, categories remain accessible until the app is closed.",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        lineHeight = 18.sp
+                                    )
+
+                                    HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.15f))
+
+                                    // Switch row
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Column(modifier = Modifier.weight(1f)) {
+                                            Text(
+                                                text = "Lock Hidden Categories",
+                                                style = MaterialTheme.typography.bodyMedium,
+                                                fontWeight = FontWeight.SemiBold
+                                            )
+                                            Text(
+                                                text = if (isPasscodeActiveNow && hasExistingPasscodeNow) "Passcode required to open hidden categories" else "Hidden categories open without passcode",
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f)
+                                            )
+                                        }
+
+                                        Switch(
+                                            checked = isPasscodeActiveNow && hasExistingPasscodeNow,
+                                            onCheckedChange = { enable ->
+                                                if (enable) {
+                                                    if (!hasExistingPasscodeNow) {
+                                                        showSetPasscodeDialog = true
+                                                    } else {
+                                                        com.example.data.CategoryPrefs.setPasscodeEnabled(context, true)
+                                                        passcodeVersion++
+                                                        Toast.makeText(context, "Passcode protection enabled", Toast.LENGTH_SHORT).show()
+                                                    }
+                                                } else {
+                                                    showTurnOffPasscodeDialog = true
+                                                }
+                                            },
+                                            modifier = Modifier.testTag("toggle_category_lock_switch")
+                                        )
+                                    }
+
+                                    // Action buttons placed under dropdown
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                    ) {
+                                        if (!hasExistingPasscodeNow) {
+                                            Button(
+                                                onClick = { showSetPasscodeDialog = true },
+                                                modifier = Modifier.fillMaxWidth().testTag("set_passcode_btn"),
+                                                shape = RoundedCornerShape(10.dp)
+                                            ) {
+                                                Icon(Icons.Default.Password, contentDescription = null, modifier = Modifier.size(16.dp))
+                                                Spacer(modifier = Modifier.width(6.dp))
+                                                Text("Set Passcode", style = MaterialTheme.typography.bodySmall)
+                                            }
+                                        } else {
+                                            OutlinedButton(
+                                                onClick = { showResetPasscodeDialog = true },
+                                                modifier = Modifier.weight(1f).testTag("reset_passcode_btn"),
+                                                shape = RoundedCornerShape(10.dp)
+                                            ) {
+                                                Icon(Icons.Default.LockReset, contentDescription = null, modifier = Modifier.size(16.dp))
+                                                Spacer(modifier = Modifier.width(6.dp))
+                                                Text("Reset Passcode", style = MaterialTheme.typography.bodySmall)
+                                            }
+
+                                            if (isPasscodeActiveNow) {
+                                                Button(
+                                                    onClick = { showTurnOffPasscodeDialog = true },
+                                                    modifier = Modifier.weight(1f).testTag("turn_off_passcode_btn"),
+                                                    shape = RoundedCornerShape(10.dp),
+                                                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
+                                                ) {
+                                                    Text("Turn Off", style = MaterialTheme.typography.bodySmall)
+                                                }
+                                            } else {
+                                                Button(
+                                                    onClick = {
+                                                        com.example.data.CategoryPrefs.setPasscodeEnabled(context, true)
+                                                        passcodeVersion++
+                                                        Toast.makeText(context, "Passcode protection turned on", Toast.LENGTH_SHORT).show()
+                                                    },
+                                                    modifier = Modifier.weight(1f).testTag("turn_on_passcode_btn"),
+                                                    shape = RoundedCornerShape(10.dp)
+                                                ) {
+                                                    Text("Turn On", style = MaterialTheme.typography.bodySmall)
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
                         // 1. Expandable About Secure Notes Setting Item
                         var isAboutExpanded by remember { mutableStateOf(false) }
                         Column(
@@ -3085,7 +3663,7 @@ fun MainScreen(
                                         Button(
                                             onClick = {
                                                 try {
-                                                    val notesToExport = localNotesList
+                                                    val notesToExport = displayNotes
                                                     val jsonArray = JSONArray()
                                                     notesToExport.forEach { n ->
                                                         val obj = JSONObject().apply {
@@ -3252,6 +3830,372 @@ fun MainScreen(
                         onClick = { showSettingsDialog = false }
                     ) {
                         Text("Done")
+                    }
+                }
+            )
+        }
+
+        // --- Category Lock Passcode Dialogs ---
+
+        // 1. Set Passcode Dialog
+        if (showSetPasscodeDialog) {
+            var passcode by remember { mutableStateOf("") }
+            var confirmPasscode by remember { mutableStateOf("") }
+            var passwordVisible by remember { mutableStateOf(false) }
+            var errorMsg by remember { mutableStateOf<String?>(null) }
+
+            AlertDialog(
+                onDismissRequest = { showSetPasscodeDialog = false },
+                icon = { Icon(Icons.Default.Lock, contentDescription = null, tint = MaterialTheme.colorScheme.primary) },
+                title = { Text("Set Category Passcode", fontWeight = FontWeight.Bold) },
+                text = {
+                    Column(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        Text(
+                            text = "Set a 4-digit PIN or passcode to protect your hidden categories.",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+
+                        OutlinedTextField(
+                            value = passcode,
+                            onValueChange = {
+                                passcode = it
+                                errorMsg = null
+                            },
+                            label = { Text("Enter Passcode") },
+                            singleLine = true,
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+                            visualTransformation = if (passwordVisible) VisualTransformation.None else PasswordVisualTransformation(),
+                            trailingIcon = {
+                                IconButton(onClick = { passwordVisible = !passwordVisible }) {
+                                    Icon(
+                                        imageVector = if (passwordVisible) Icons.Default.VisibilityOff else Icons.Default.Visibility,
+                                        contentDescription = if (passwordVisible) "Hide password" else "Show password"
+                                    )
+                                }
+                            },
+                            modifier = Modifier.fillMaxWidth().testTag("set_passcode_input"),
+                            shape = RoundedCornerShape(12.dp)
+                        )
+
+                        OutlinedTextField(
+                            value = confirmPasscode,
+                            onValueChange = {
+                                confirmPasscode = it
+                                errorMsg = null
+                            },
+                            label = { Text("Confirm Passcode") },
+                            singleLine = true,
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+                            visualTransformation = if (passwordVisible) VisualTransformation.None else PasswordVisualTransformation(),
+                            modifier = Modifier.fillMaxWidth().testTag("set_passcode_confirm_input"),
+                            shape = RoundedCornerShape(12.dp)
+                        )
+
+                        if (errorMsg != null) {
+                            Text(
+                                text = errorMsg!!,
+                                color = MaterialTheme.colorScheme.error,
+                                style = MaterialTheme.typography.labelMedium
+                            )
+                        }
+                    }
+                },
+                confirmButton = {
+                    Button(
+                        onClick = {
+                            if (passcode.trim().length < 4) {
+                                errorMsg = "Passcode must be at least 4 digits"
+                            } else if (passcode.trim() != confirmPasscode.trim()) {
+                                errorMsg = "Passcodes do not match"
+                            } else {
+                                com.example.data.CategoryPrefs.setPasscode(context, passcode.trim())
+                                passcodeVersion++
+                                Toast.makeText(context, "Passcode configured & protection active!", Toast.LENGTH_SHORT).show()
+                                showSetPasscodeDialog = false
+                            }
+                        },
+                        modifier = Modifier.testTag("save_passcode_btn")
+                    ) {
+                        Text("Save Passcode")
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { showSetPasscodeDialog = false }) {
+                        Text("Cancel")
+                    }
+                }
+            )
+        }
+
+        // 2. Reset Passcode Dialog
+        if (showResetPasscodeDialog) {
+            var currentPasscode by remember { mutableStateOf("") }
+            var newPasscode by remember { mutableStateOf("") }
+            var confirmNewPasscode by remember { mutableStateOf("") }
+            var passwordVisible by remember { mutableStateOf(false) }
+            var errorMsg by remember { mutableStateOf<String?>(null) }
+
+            AlertDialog(
+                onDismissRequest = { showResetPasscodeDialog = false },
+                icon = { Icon(Icons.Default.LockReset, contentDescription = null, tint = MaterialTheme.colorScheme.primary) },
+                title = { Text("Reset Passcode", fontWeight = FontWeight.Bold) },
+                text = {
+                    Column(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        Text(
+                            text = "Enter your current passcode and choose a new one.",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+
+                        OutlinedTextField(
+                            value = currentPasscode,
+                            onValueChange = {
+                                currentPasscode = it
+                                errorMsg = null
+                            },
+                            label = { Text("Current Passcode") },
+                            singleLine = true,
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+                            visualTransformation = if (passwordVisible) VisualTransformation.None else PasswordVisualTransformation(),
+                            modifier = Modifier.fillMaxWidth().testTag("reset_current_passcode_input"),
+                            shape = RoundedCornerShape(12.dp)
+                        )
+
+                        OutlinedTextField(
+                            value = newPasscode,
+                            onValueChange = {
+                                newPasscode = it
+                                errorMsg = null
+                            },
+                            label = { Text("New Passcode") },
+                            singleLine = true,
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+                            visualTransformation = if (passwordVisible) VisualTransformation.None else PasswordVisualTransformation(),
+                            trailingIcon = {
+                                IconButton(onClick = { passwordVisible = !passwordVisible }) {
+                                    Icon(
+                                        imageVector = if (passwordVisible) Icons.Default.VisibilityOff else Icons.Default.Visibility,
+                                        contentDescription = if (passwordVisible) "Hide password" else "Show password"
+                                    )
+                                }
+                            },
+                            modifier = Modifier.fillMaxWidth().testTag("reset_new_passcode_input"),
+                            shape = RoundedCornerShape(12.dp)
+                        )
+
+                        OutlinedTextField(
+                            value = confirmNewPasscode,
+                            onValueChange = {
+                                confirmNewPasscode = it
+                                errorMsg = null
+                            },
+                            label = { Text("Confirm New Passcode") },
+                            singleLine = true,
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+                            visualTransformation = if (passwordVisible) VisualTransformation.None else PasswordVisualTransformation(),
+                            modifier = Modifier.fillMaxWidth().testTag("reset_confirm_passcode_input"),
+                            shape = RoundedCornerShape(12.dp)
+                        )
+
+                        if (errorMsg != null) {
+                            Text(
+                                text = errorMsg!!,
+                                color = MaterialTheme.colorScheme.error,
+                                style = MaterialTheme.typography.labelMedium
+                            )
+                        }
+                    }
+                },
+                confirmButton = {
+                    Button(
+                        onClick = {
+                            if (!com.example.data.CategoryPrefs.verifyPasscode(context, currentPasscode)) {
+                                errorMsg = "Current passcode is incorrect"
+                            } else if (newPasscode.trim().length < 4) {
+                                errorMsg = "New passcode must be at least 4 digits"
+                            } else if (newPasscode.trim() != confirmNewPasscode.trim()) {
+                                errorMsg = "New passcodes do not match"
+                            } else {
+                                com.example.data.CategoryPrefs.setPasscode(context, newPasscode.trim())
+                                passcodeVersion++
+                                Toast.makeText(context, "Passcode reset successfully!", Toast.LENGTH_SHORT).show()
+                                showResetPasscodeDialog = false
+                            }
+                        },
+                        modifier = Modifier.testTag("confirm_reset_passcode_btn")
+                    ) {
+                        Text("Update Passcode")
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { showResetPasscodeDialog = false }) {
+                        Text("Cancel")
+                    }
+                }
+            )
+        }
+
+        // 3. Turn Off Passcode Dialog
+        if (showTurnOffPasscodeDialog) {
+            var currentPasscode by remember { mutableStateOf("") }
+            var passwordVisible by remember { mutableStateOf(false) }
+            var errorMsg by remember { mutableStateOf<String?>(null) }
+
+            AlertDialog(
+                onDismissRequest = { showTurnOffPasscodeDialog = false },
+                icon = { Icon(Icons.Default.LockOpen, contentDescription = null, tint = MaterialTheme.colorScheme.error) },
+                title = { Text("Turn Off Passcode Protection", fontWeight = FontWeight.Bold) },
+                text = {
+                    Column(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        Text(
+                            text = "Enter your current passcode to turn off category lock. Hidden categories will be accessible without a passcode.",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+
+                        OutlinedTextField(
+                            value = currentPasscode,
+                            onValueChange = {
+                                currentPasscode = it
+                                errorMsg = null
+                            },
+                            label = { Text("Current Passcode") },
+                            singleLine = true,
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+                            visualTransformation = if (passwordVisible) VisualTransformation.None else PasswordVisualTransformation(),
+                            trailingIcon = {
+                                IconButton(onClick = { passwordVisible = !passwordVisible }) {
+                                    Icon(
+                                        imageVector = if (passwordVisible) Icons.Default.VisibilityOff else Icons.Default.Visibility,
+                                        contentDescription = if (passwordVisible) "Hide password" else "Show password"
+                                    )
+                                }
+                            },
+                            modifier = Modifier.fillMaxWidth().testTag("turn_off_passcode_input"),
+                            shape = RoundedCornerShape(12.dp)
+                        )
+
+                        if (errorMsg != null) {
+                            Text(
+                                text = errorMsg!!,
+                                color = MaterialTheme.colorScheme.error,
+                                style = MaterialTheme.typography.labelMedium
+                            )
+                        }
+                    }
+                },
+                confirmButton = {
+                    Button(
+                        onClick = {
+                            if (!com.example.data.CategoryPrefs.verifyPasscode(context, currentPasscode)) {
+                                errorMsg = "Incorrect passcode"
+                            } else {
+                                com.example.data.CategoryPrefs.setPasscodeEnabled(context, false)
+                                passcodeVersion++
+                                Toast.makeText(context, "Passcode protection turned off", Toast.LENGTH_SHORT).show()
+                                showTurnOffPasscodeDialog = false
+                            }
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
+                        modifier = Modifier.testTag("confirm_turn_off_passcode_btn")
+                    ) {
+                        Text("Turn Off")
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { showTurnOffPasscodeDialog = false }) {
+                        Text("Cancel")
+                    }
+                }
+            )
+        }
+
+        // 4. Unlock Category Passcode Dialog
+        if (showUnlockPasscodeDialog) {
+            var enteredPasscode by remember { mutableStateOf("") }
+            var passwordVisible by remember { mutableStateOf(false) }
+            var errorMsg by remember { mutableStateOf<String?>(null) }
+            val targetCategory = pendingUnlockCategory ?: selectedCategory ?: "Category"
+
+            AlertDialog(
+                onDismissRequest = {
+                    showUnlockPasscodeDialog = false
+                },
+                icon = { Icon(Icons.Default.Lock, contentDescription = null, tint = MaterialTheme.colorScheme.primary) },
+                title = { Text("Unlock '$targetCategory'", fontWeight = FontWeight.Bold) },
+                text = {
+                    Column(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        Text(
+                            text = "This category is locked. Enter your passcode to view its notes. It will remain unlocked until the app is closed.",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+
+                        OutlinedTextField(
+                            value = enteredPasscode,
+                            onValueChange = {
+                                enteredPasscode = it
+                                errorMsg = null
+                            },
+                            label = { Text("Enter Passcode") },
+                            singleLine = true,
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+                            visualTransformation = if (passwordVisible) VisualTransformation.None else PasswordVisualTransformation(),
+                            trailingIcon = {
+                                IconButton(onClick = { passwordVisible = !passwordVisible }) {
+                                    Icon(
+                                        imageVector = if (passwordVisible) Icons.Default.VisibilityOff else Icons.Default.Visibility,
+                                        contentDescription = if (passwordVisible) "Hide password" else "Show password"
+                                    )
+                                }
+                            },
+                            modifier = Modifier.fillMaxWidth().testTag("unlock_passcode_input"),
+                            shape = RoundedCornerShape(12.dp)
+                        )
+
+                        if (errorMsg != null) {
+                            Text(
+                                text = errorMsg!!,
+                                color = MaterialTheme.colorScheme.error,
+                                style = MaterialTheme.typography.labelMedium
+                            )
+                        }
+                    }
+                },
+                confirmButton = {
+                    Button(
+                        onClick = {
+                            if (!com.example.data.CategoryPrefs.verifyPasscode(context, enteredPasscode)) {
+                                errorMsg = "Incorrect passcode"
+                            } else {
+                                viewModel.unlockCategoryForSession(targetCategory)
+                                viewModel.setSelectedCategory(targetCategory)
+                                passcodeVersion++
+                                showUnlockPasscodeDialog = false
+                                Toast.makeText(context, "'$targetCategory' unlocked", Toast.LENGTH_SHORT).show()
+                            }
+                        },
+                        modifier = Modifier.testTag("confirm_unlock_category_btn")
+                    ) {
+                        Text("Unlock")
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { showUnlockPasscodeDialog = false }) {
+                        Text("Cancel")
                     }
                 }
             )
@@ -3594,11 +4538,9 @@ fun NoteCard(
 
                 Spacer(modifier = Modifier.height(10.dp))
 
-                // 5. Bottom block: translucent squircle and schedule tag placed next to each other
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
+                // 5. Bottom block: translucent squircle toolbar, and below it, the schedule tag
+                Column(
+                    modifier = Modifier.fillMaxWidth()
                 ) {
                     // Translucent action squircle with link, pin, push, delete buttons
                     Surface(
@@ -3681,7 +4623,6 @@ fun NoteCard(
                                 }
                             }
 
-
                             AppTooltip(text = "Delete Note") {
                                 IconButton(
                                     onClick = onDelete,
@@ -3698,12 +4639,13 @@ fun NoteCard(
                         }
                     }
 
-                    // Schedule tag placed beside the translucent squircle
+                    // Schedule tag placed below the translucent squircle so they never overlap
                     if (note.isScheduled && note.scheduledTime != null) {
+                        Spacer(modifier = Modifier.height(4.dp))
                         Row(
                             verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.spacedBy(4.dp),
-                            modifier = Modifier.padding(start = 8.dp)
+                            modifier = Modifier.fillMaxWidth().padding(horizontal = 2.dp)
                         ) {
                             Icon(
                                 imageVector = Icons.Default.Schedule,
@@ -3711,10 +4653,34 @@ fun NoteCard(
                                 tint = MaterialTheme.colorScheme.primary,
                                 modifier = Modifier.size(14.dp)
                             )
+                            val schedLabel = buildString {
+                                val df = java.text.SimpleDateFormat("MMM dd, h:mm a", java.util.Locale.getDefault())
+                                val formattedDate = df.format(java.util.Date(note.scheduledTime))
+                                val freq = note.repeatFrequency?.lowercase() ?: "once"
+                                when {
+                                    freq == "minutes" -> {
+                                        append("Upcoming: $formattedDate • Every ${note.repeatIntervalMinutes ?: 15}m")
+                                    }
+                                    freq == "daily" -> {
+                                        append("Upcoming: $formattedDate • Daily")
+                                    }
+                                    freq == "weekly" -> {
+                                        append("Upcoming: $formattedDate • Weekly")
+                                    }
+                                    freq == "monthly" -> {
+                                        append("Upcoming: $formattedDate • Monthly")
+                                    }
+                                    else -> {
+                                        append("Upcoming: $formattedDate")
+                                    }
+                                }
+                            }
                             Text(
-                                text = java.text.SimpleDateFormat("MMM dd, HH:mm", java.util.Locale.getDefault()).format(java.util.Date(note.scheduledTime)),
+                                text = schedLabel,
                                 style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
-                                color = MaterialTheme.colorScheme.primary
+                                color = MaterialTheme.colorScheme.primary,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
                             )
                         }
                     }
@@ -4000,8 +4966,29 @@ fun NoteCard(
                             tint = MaterialTheme.colorScheme.primary,
                             modifier = Modifier.size(14.dp)
                         )
+                        val schedLabel = buildString {
+                            val df = java.text.SimpleDateFormat("MMM dd, h:mm a", java.util.Locale.getDefault())
+                            val formattedDate = df.format(java.util.Date(note.scheduledTime))
+                            when {
+                                note.repeatFrequency.equals("minutes", ignoreCase = true) -> {
+                                    append("Every ${note.repeatIntervalMinutes ?: 15}m • Upcoming: $formattedDate")
+                                }
+                                note.repeatFrequency.equals("daily", ignoreCase = true) -> {
+                                    append("Daily • Upcoming: $formattedDate")
+                                }
+                                note.repeatFrequency.equals("weekly", ignoreCase = true) -> {
+                                    append("Weekly • Upcoming: $formattedDate")
+                                }
+                                note.repeatFrequency.equals("monthly", ignoreCase = true) -> {
+                                    append("Monthly • Upcoming: $formattedDate")
+                                }
+                                else -> {
+                                    append("Upcoming: $formattedDate")
+                                }
+                            }
+                        }
                         Text(
-                            text = java.text.SimpleDateFormat("MMM dd, HH:mm", java.util.Locale.getDefault()).format(java.util.Date(note.scheduledTime)),
+                            text = schedLabel,
                             style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
                             color = MaterialTheme.colorScheme.primary
                         )
@@ -4049,6 +5036,8 @@ fun NoteEditorDialog(
         isScheduled: Boolean,
         scheduledTime: Long?,
         repeatFrequency: String?,
+        repeatIntervalMinutes: Int?,
+        repeatUntilTime: Long?,
         tags: String?,
         autoTags: String?,
         attachmentUri: String?,
@@ -4070,6 +5059,8 @@ fun NoteEditorDialog(
         isScheduled: Boolean,
         scheduledTime: Long?,
         repeatFrequency: String?,
+        repeatIntervalMinutes: Int?,
+        repeatUntilTime: Long?,
         tags: String?,
         autoTags: String?,
         attachmentUri: String?,
@@ -4084,7 +5075,16 @@ fun NoteEditorDialog(
     var titleValue by remember { mutableStateOf(TextFieldValue(note?.title ?: "", TextRange((note?.title ?: "").length))) }
     var title by DynamicTextDelegate({ titleValue }, { titleValue = it })
 
-    var contentValue by remember { mutableStateOf(TextFieldValue(note?.content ?: "", TextRange((note?.content ?: "").length))) }
+    val initialRich = remember(note?.content) {
+        com.example.ui.RichTextHelper.parseFormattedText(note?.content ?: "")
+    }
+    var contentValue by remember {
+        mutableStateOf(TextFieldValue(initialRich.plainText, TextRange(initialRich.plainText.length)))
+    }
+    var boldSpans by remember { mutableStateOf(initialRich.boldRanges) }
+    var italicSpans by remember { mutableStateOf(initialRich.italicRanges) }
+    var underlineSpans by remember { mutableStateOf(initialRich.underlineRanges) }
+
     var content by DynamicTextDelegate({ contentValue }, { contentValue = it })
 
     var isBoldActive by remember { mutableStateOf(false) }
@@ -4093,35 +5093,30 @@ fun NoteEditorDialog(
     var isTitleFocused by remember { mutableStateOf(false) }
     var isContentFocused by remember { mutableStateOf(false) }
 
-    fun toggleFormat(formatSymbol: String, isActive: Boolean, value: TextFieldValue, onValueChange: (TextFieldValue) -> Unit) {
-        val text = value.text
-        val selection = value.selection
-        if (selection.length > 0) {
-            val start = selection.start
-            val end = selection.end
-            val selectedText = text.substring(start, end)
-            val wrapped = "$formatSymbol$selectedText$formatSymbol"
-            val newText = text.substring(0, start) + wrapped + text.substring(end)
-            onValueChange(TextFieldValue(newText, TextRange(start + formatSymbol.length + selectedText.length + formatSymbol.length)))
+    fun toggleBold() {
+        val sel = contentValue.selection
+        if (sel.min < sel.max) {
+            boldSpans = com.example.ui.RichTextHelper.toggleRangeStyle(sel.min, sel.max, boldSpans, contentValue.text.length)
         } else {
-            val cursor = selection.start
-            if (isActive) {
-                val inserted = "$formatSymbol$formatSymbol"
-                val newText = text.substring(0, cursor) + inserted + text.substring(cursor)
-                onValueChange(TextFieldValue(newText, TextRange(cursor + formatSymbol.length)))
-            } else {
-                if (cursor + formatSymbol.length <= text.length && text.substring(cursor, cursor + formatSymbol.length) == formatSymbol) {
-                    onValueChange(TextFieldValue(text, TextRange(cursor + formatSymbol.length)))
-                }
-            }
+            isBoldActive = !isBoldActive
         }
     }
 
-    fun onFormatClick(formatSymbol: String, isActive: Boolean) {
-        if (isTitleFocused) {
-            toggleFormat(formatSymbol, isActive, titleValue) { titleValue = it }
+    fun toggleItalic() {
+        val sel = contentValue.selection
+        if (sel.min < sel.max) {
+            italicSpans = com.example.ui.RichTextHelper.toggleRangeStyle(sel.min, sel.max, italicSpans, contentValue.text.length)
         } else {
-            toggleFormat(formatSymbol, isActive, contentValue) { contentValue = it }
+            isItalicActive = !isItalicActive
+        }
+    }
+
+    fun toggleUnderline() {
+        val sel = contentValue.selection
+        if (sel.min < sel.max) {
+            underlineSpans = com.example.ui.RichTextHelper.toggleRangeStyle(sel.min, sel.max, underlineSpans, contentValue.text.length)
+        } else {
+            isUnderlineActive = !isUnderlineActive
         }
     }
 
@@ -4164,6 +5159,8 @@ fun NoteEditorDialog(
     var isScheduled by remember { mutableStateOf(note?.isScheduled ?: false) }
     var scheduledTime by remember { mutableStateOf<Long?>(note?.scheduledTime) }
     var repeatFrequency by remember { mutableStateOf(note?.repeatFrequency ?: "once") }
+    var repeatIntervalMinutes by remember { mutableIntStateOf(note?.repeatIntervalMinutes ?: 15) }
+    var repeatUntilTime by remember { mutableStateOf<Long?>(note?.repeatUntilTime) }
     var showSchedulingWindow by remember { mutableStateOf(note?.isScheduled ?: false) }
     var isImmediate by remember { mutableStateOf(note?.isScheduled == true && note?.scheduledTime != null && (note.scheduledTime!! - System.currentTimeMillis() < 60000L)) }
     var isPersistentNotification by remember { mutableStateOf(note?.isPersistentNotification ?: false) }
@@ -4356,6 +5353,55 @@ fun NoteEditorDialog(
                 ) {
                     val context = LocalContext.current
 
+                    // Upcoming Schedule Banner inside Note Editor
+                    if (isScheduled && scheduledTime != null) {
+                        Surface(
+                            color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.5f),
+                            shape = RoundedCornerShape(12.dp),
+                            border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.25f)),
+                            modifier = Modifier.fillMaxWidth().padding(bottom = 10.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Schedule,
+                                    contentDescription = null,
+                                    tint = MaterialTheme.colorScheme.primary,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                                val schedText = buildString {
+                                    val df = java.text.SimpleDateFormat("MMM dd, yyyy h:mm a", java.util.Locale.getDefault())
+                                    val formattedTime = df.format(java.util.Date(scheduledTime!!))
+                                    when {
+                                        repeatFrequency.equals("minutes", ignoreCase = true) -> {
+                                            append("Upcoming Reminder: $formattedTime (Repeats every ${repeatIntervalMinutes}m)")
+                                        }
+                                        repeatFrequency.equals("daily", ignoreCase = true) -> {
+                                            append("Upcoming Reminder: $formattedTime (Repeats daily)")
+                                        }
+                                        repeatFrequency.equals("weekly", ignoreCase = true) -> {
+                                            append("Upcoming Reminder: $formattedTime (Repeats weekly)")
+                                        }
+                                        repeatFrequency.equals("monthly", ignoreCase = true) -> {
+                                            append("Upcoming Reminder: $formattedTime (Repeats monthly)")
+                                        }
+                                        else -> {
+                                            append("Upcoming Reminder: $formattedTime")
+                                        }
+                                    }
+                                }
+                                Text(
+                                    text = schedText,
+                                    style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold),
+                                    color = MaterialTheme.colorScheme.primary
+                                )
+                            }
+                        }
+                    }
+
                     // AI Extraction Input Area
                     if (isAiEnabled) {
                         OutlinedTextField(
@@ -4470,6 +5516,34 @@ fun NoteEditorDialog(
                                             calendar.set(java.util.Calendar.SECOND, 0)
                                             scheduledTime = calendar.timeInMillis
                                             isScheduled = true
+                                        },
+                                        calendar.get(java.util.Calendar.HOUR_OF_DAY),
+                                        calendar.get(java.util.Calendar.MINUTE),
+                                        true
+                                    ).show()
+                                },
+                                calendar.get(java.util.Calendar.YEAR),
+                                calendar.get(java.util.Calendar.MONTH),
+                                calendar.get(java.util.Calendar.DAY_OF_MONTH)
+                            ).show()
+                        }
+
+                        val showUntilDateTimePicker = {
+                            val calendar = java.util.Calendar.getInstance()
+                            repeatUntilTime?.let { calendar.timeInMillis = it }
+                            android.app.DatePickerDialog(
+                                context,
+                                { _, year, month, dayOfMonth ->
+                                    calendar.set(java.util.Calendar.YEAR, year)
+                                    calendar.set(java.util.Calendar.MONTH, month)
+                                    calendar.set(java.util.Calendar.DAY_OF_MONTH, dayOfMonth)
+                                    android.app.TimePickerDialog(
+                                        context,
+                                        { _, hourOfDay, minute ->
+                                            calendar.set(java.util.Calendar.HOUR_OF_DAY, hourOfDay)
+                                            calendar.set(java.util.Calendar.MINUTE, minute)
+                                            calendar.set(java.util.Calendar.SECOND, 0)
+                                            repeatUntilTime = calendar.timeInMillis
                                         },
                                         calendar.get(java.util.Calendar.HOUR_OF_DAY),
                                         calendar.get(java.util.Calendar.MINUTE),
@@ -4610,8 +5684,15 @@ fun NoteEditorDialog(
                                                 verticalAlignment = Alignment.CenterVertically,
                                                 modifier = Modifier.fillMaxWidth()
                                             ) {
+                                                val repeatBtnLabel = when {
+                                                    repeatFrequency.equals("minutes", ignoreCase = true) -> "Every ${repeatIntervalMinutes}m"
+                                                    repeatFrequency.equals("daily", ignoreCase = true) -> "Daily"
+                                                    repeatFrequency.equals("weekly", ignoreCase = true) -> "Weekly"
+                                                    repeatFrequency.equals("monthly", ignoreCase = true) -> "Monthly"
+                                                    else -> "Once"
+                                                }
                                                 Text(
-                                                    text = repeatFrequency.replaceFirstChar { it.uppercase() },
+                                                    text = repeatBtnLabel,
                                                     style = MaterialTheme.typography.bodyMedium,
                                                     maxLines = 1,
                                                     overflow = TextOverflow.Ellipsis
@@ -4628,15 +5709,126 @@ fun NoteEditorDialog(
                                             expanded = showRepeatDropdown,
                                             onDismissRequest = { showRepeatDropdown = false }
                                         ) {
-                                            listOf("once", "daily", "weekly", "monthly").forEach { freq ->
-                                                DropdownMenuItem(
-                                                    text = { Text(freq.replaceFirstChar { it.uppercase() }) },
-                                                    onClick = {
-                                                        repeatFrequency = freq
-                                                        showRepeatDropdown = false
-                                                    }
-                                                )
-                                            }
+                                            DropdownMenuItem(
+                                                text = { Text("Once") },
+                                                onClick = {
+                                                    repeatFrequency = "once"
+                                                    showRepeatDropdown = false
+                                                }
+                                            )
+                                            DropdownMenuItem(
+                                                text = { Text("Every _ minutes until _") },
+                                                onClick = {
+                                                    repeatFrequency = "minutes"
+                                                    if (repeatIntervalMinutes <= 0) repeatIntervalMinutes = 15
+                                                    showRepeatDropdown = false
+                                                }
+                                            )
+                                            DropdownMenuItem(
+                                                text = { Text("Daily") },
+                                                onClick = {
+                                                    repeatFrequency = "daily"
+                                                    showRepeatDropdown = false
+                                                }
+                                            )
+                                            DropdownMenuItem(
+                                                text = { Text("Weekly") },
+                                                onClick = {
+                                                    repeatFrequency = "weekly"
+                                                    showRepeatDropdown = false
+                                                }
+                                            )
+                                            DropdownMenuItem(
+                                                text = { Text("Monthly") },
+                                                onClick = {
+                                                    repeatFrequency = "monthly"
+                                                    showRepeatDropdown = false
+                                                }
+                                            )
+                                        }
+                                    }
+                                }
+
+                                if (repeatFrequency.equals("minutes", ignoreCase = true)) {
+                                    Spacer(modifier = Modifier.height(10.dp))
+                                    Column(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .background(
+                                                MaterialTheme.colorScheme.surface.copy(alpha = 0.6f),
+                                                RoundedCornerShape(12.dp)
+                                            )
+                                            .border(
+                                                1.dp,
+                                                MaterialTheme.colorScheme.primary.copy(alpha = 0.3f),
+                                                RoundedCornerShape(12.dp)
+                                            )
+                                            .padding(10.dp),
+                                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                                    ) {
+                                        Row(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                        ) {
+                                            Text(
+                                                text = "Every",
+                                                style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Medium),
+                                                color = MaterialTheme.colorScheme.onSurface
+                                            )
+                                            OutlinedTextField(
+                                                value = if (repeatIntervalMinutes > 0) repeatIntervalMinutes.toString() else "",
+                                                onValueChange = { newVal ->
+                                                    val num = newVal.filter { it.isDigit() }.toIntOrNull()
+                                                    repeatIntervalMinutes = num ?: 0
+                                                },
+                                                modifier = Modifier
+                                                    .width(76.dp)
+                                                    .testTag("repeat_interval_minutes_input"),
+                                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                                                singleLine = true,
+                                                textStyle = MaterialTheme.typography.bodyMedium.copy(textAlign = TextAlign.Center),
+                                                shape = RoundedCornerShape(8.dp)
+                                            )
+                                            Text(
+                                                text = "minutes until:",
+                                                style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Medium),
+                                                color = MaterialTheme.colorScheme.onSurface
+                                            )
+                                        }
+
+                                        OutlinedButton(
+                                            onClick = { showUntilDateTimePicker() },
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .testTag("repeat_until_date_time_btn"),
+                                            shape = RoundedCornerShape(10.dp),
+                                            colors = ButtonDefaults.outlinedButtonColors(
+                                                containerColor = if (repeatUntilTime != null) MaterialTheme.colorScheme.primary.copy(alpha = 0.12f) else Color.Transparent,
+                                                contentColor = if (repeatUntilTime != null) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface
+                                            ),
+                                            border = BorderStroke(
+                                                1.dp,
+                                                if (repeatUntilTime != null) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline
+                                            ),
+                                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp)
+                                        ) {
+                                            Icon(
+                                                imageVector = Icons.Default.Event,
+                                                contentDescription = null,
+                                                modifier = Modifier.size(16.dp)
+                                            )
+                                            Spacer(modifier = Modifier.width(6.dp))
+                                            Text(
+                                                text = if (repeatUntilTime != null) {
+                                                    "Until " + java.text.SimpleDateFormat("MMM dd, yyyy HH:mm", java.util.Locale.getDefault()).format(java.util.Date(repeatUntilTime!!))
+                                                } else {
+                                                    "Set End Date & Time"
+                                                },
+                                                style = MaterialTheme.typography.bodyMedium,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis
+                                            )
                                         }
                                     }
                                 }
@@ -4725,6 +5917,41 @@ fun NoteEditorDialog(
                                         }
                                     }
                                 }
+
+                                if (isScheduled && scheduledTime != null) {
+                                    Surface(
+                                        shape = RoundedCornerShape(10.dp),
+                                        color = MaterialTheme.colorScheme.primary.copy(alpha = 0.12f),
+                                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.25f)),
+                                        modifier = Modifier.fillMaxWidth().testTag("schedule_card_next_trigger_banner")
+                                    ) {
+                                        Row(
+                                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                        ) {
+                                            Icon(
+                                                imageVector = Icons.Default.NotificationsActive,
+                                                contentDescription = null,
+                                                tint = MaterialTheme.colorScheme.primary,
+                                                modifier = Modifier.size(16.dp)
+                                            )
+                                            val nowTime = System.currentTimeMillis()
+                                            val schedMs = scheduledTime!!
+                                            val triggerLabel = if (isImmediate || (schedMs - nowTime) <= 5000L) {
+                                                "Next Trigger: Immediate Push on Save" + if (!repeatFrequency.equals("once", ignoreCase = true)) " (then repeats $repeatFrequency)" else ""
+                                            } else {
+                                                val dateStr = java.text.SimpleDateFormat("MMM dd, yyyy 'at' h:mm a", java.util.Locale.getDefault()).format(java.util.Date(schedMs))
+                                                "Next Trigger: $dateStr" + if (repeatFrequency.equals("minutes", ignoreCase = true)) " (Every ${repeatIntervalMinutes}m)" else if (!repeatFrequency.equals("once", ignoreCase = true)) " ($repeatFrequency)" else ""
+                                            }
+                                            Text(
+                                                text = triggerLabel,
+                                                style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.SemiBold),
+                                                color = MaterialTheme.colorScheme.primary
+                                            )
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -4791,6 +6018,8 @@ fun NoteEditorDialog(
                                     isScheduled,
                                     scheduledTime,
                                     repeatFrequency,
+                                    repeatIntervalMinutes,
+                                    repeatUntilTime,
                                     selectedTags.joinToString("|"),
                                     if (selectedAutoTags.isNotEmpty()) selectedAutoTags.joinToString("|") else null,
                                     attachmentUri,
@@ -4804,10 +6033,21 @@ fun NoteEditorDialog(
                         )
                     } else {
                         if (isEditMode) {
-                            // Standard rich multiline input
+                            // Standard rich multiline input with real-time visual formatting
                             OutlinedTextField(
                                 value = contentValue,
-                                onValueChange = { contentValue = it },
+                                onValueChange = { newValue ->
+                                    val oldText = contentValue.text
+                                    val newText = newValue.text
+                                    if (newText != oldText) {
+                                        boldSpans = com.example.ui.RichTextHelper.updateRangesOnEdit(oldText, newText, boldSpans, isBoldActive)
+                                        italicSpans = com.example.ui.RichTextHelper.updateRangesOnEdit(oldText, newText, italicSpans, isItalicActive)
+                                        underlineSpans = com.example.ui.RichTextHelper.updateRangesOnEdit(oldText, newText, underlineSpans, isUnderlineActive)
+                                    }
+                                    contentValue = newValue
+                                    content = newValue.text
+                                },
+                                visualTransformation = com.example.ui.RichTextHelper.createRichVisualTransformation(boldSpans, italicSpans, underlineSpans),
                                 label = { Text("Note content") },
                                 placeholder = { Text("Write something down...") },
                                 modifier = Modifier
@@ -4818,6 +6058,98 @@ fun NoteEditorDialog(
                                 keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Sentences),
                                 shape = RoundedCornerShape(12.dp)
                             )
+
+                            Spacer(modifier = Modifier.height(6.dp))
+
+                            // Text Formatting Toolbar placed directly below note content box and above attachments
+                            Surface(
+                                modifier = Modifier.padding(vertical = 2.dp),
+                                shape = RoundedCornerShape(12.dp),
+                                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f),
+                                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.15f))
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 4.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                ) {
+                                    val sel = contentValue.selection
+                                    val isBoldHighlighted = if (sel.min < sel.max) {
+                                        boldSpans.any { it.first <= sel.min && it.last >= sel.max }
+                                    } else isBoldActive
+
+                                    val isItalicHighlighted = if (sel.min < sel.max) {
+                                        italicSpans.any { it.first <= sel.min && it.last >= sel.max }
+                                    } else isItalicActive
+
+                                    val isUnderlineHighlighted = if (sel.min < sel.max) {
+                                        underlineSpans.any { it.first <= sel.min && it.last >= sel.max }
+                                    } else isUnderlineActive
+
+                                    // Bold Toggle Button
+                                    Box(
+                                        modifier = Modifier
+                                            .size(34.dp)
+                                            .clip(CircleShape)
+                                            .background(
+                                                if (isBoldHighlighted) MaterialTheme.colorScheme.primary.copy(alpha = 0.25f)
+                                                else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)
+                                            )
+                                            .clickable { toggleBold() }
+                                            .testTag("format_bold_btn"),
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.FormatBold,
+                                            contentDescription = "Format Bold",
+                                            tint = if (isBoldHighlighted) MaterialTheme.colorScheme.primary else onDialogText.copy(alpha = 0.7f),
+                                            modifier = Modifier.size(18.dp)
+                                        )
+                                    }
+
+                                    // Italic Toggle Button
+                                    Box(
+                                        modifier = Modifier
+                                            .size(34.dp)
+                                            .clip(CircleShape)
+                                            .background(
+                                                if (isItalicHighlighted) MaterialTheme.colorScheme.primary.copy(alpha = 0.25f)
+                                                else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)
+                                            )
+                                            .clickable { toggleItalic() }
+                                            .testTag("format_italic_btn"),
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.FormatItalic,
+                                            contentDescription = "Format Italic",
+                                            tint = if (isItalicHighlighted) MaterialTheme.colorScheme.primary else onDialogText.copy(alpha = 0.7f),
+                                            modifier = Modifier.size(18.dp)
+                                        )
+                                    }
+
+                                    // Underline Toggle Button
+                                    Box(
+                                        modifier = Modifier
+                                            .size(34.dp)
+                                            .clip(CircleShape)
+                                            .background(
+                                                if (isUnderlineHighlighted) MaterialTheme.colorScheme.primary.copy(alpha = 0.25f)
+                                                else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)
+                                            )
+                                            .clickable { toggleUnderline() }
+                                            .testTag("format_underline_btn"),
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.FormatUnderlined,
+                                            contentDescription = "Format Underline",
+                                            tint = if (isUnderlineHighlighted) MaterialTheme.colorScheme.primary else onDialogText.copy(alpha = 0.7f),
+                                            modifier = Modifier.size(18.dp)
+                                        )
+                                    }
+                                }
+                            }
                         } else {
                             // Beautiful rich body text display in View Mode
                             Column(
@@ -4826,8 +6158,31 @@ fun NoteEditorDialog(
                                     .heightIn(min = 80.dp)
                                     .padding(horizontal = 4.dp, vertical = 2.dp)
                             ) {
+                                val annotatedBody = remember(contentValue.text, boldSpans, italicSpans, underlineSpans) {
+                                    androidx.compose.ui.text.buildAnnotatedString {
+                                        append(contentValue.text.ifEmpty { "Empty note content" })
+                                        if (contentValue.text.isNotEmpty()) {
+                                            val len = length
+                                            boldSpans.forEach { r ->
+                                                val s = r.first.coerceIn(0, len)
+                                                val e = r.last.coerceIn(0, len)
+                                                if (s < e) addStyle(androidx.compose.ui.text.SpanStyle(fontWeight = FontWeight.Bold), s, e)
+                                            }
+                                            italicSpans.forEach { r ->
+                                                val s = r.first.coerceIn(0, len)
+                                                val e = r.last.coerceIn(0, len)
+                                                if (s < e) addStyle(androidx.compose.ui.text.SpanStyle(fontStyle = androidx.compose.ui.text.font.FontStyle.Italic), s, e)
+                                            }
+                                            underlineSpans.forEach { r ->
+                                                val s = r.first.coerceIn(0, len)
+                                                val e = r.last.coerceIn(0, len)
+                                                if (s < e) addStyle(androidx.compose.ui.text.SpanStyle(textDecoration = androidx.compose.ui.text.style.TextDecoration.Underline), s, e)
+                                            }
+                                        }
+                                    }
+                                }
                                 Text(
-                                    text = content.ifEmpty { "Empty note content" },
+                                    text = annotatedBody,
                                     style = MaterialTheme.typography.bodyLarge,
                                     color = onDialogText.copy(alpha = 0.85f),
                                     lineHeight = 22.sp
@@ -5131,96 +6486,6 @@ fun NoteEditorDialog(
                     }
 
                     Spacer(modifier = Modifier.height(14.dp))
-
-                    // Persistently visible Text Formatting Toolbar
-                    if (isEditMode && !isTaskList) {
-                        Surface(
-                            modifier = Modifier
-                                .padding(vertical = 4.dp),
-                            shape = RoundedCornerShape(12.dp),
-                            color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f),
-                            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.15f))
-                        ) {
-                            Row(
-                                modifier = Modifier.padding(horizontal = 4.dp, vertical = 4.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(4.dp)
-                            ) {
-                                // Bold Toggle Button
-                                Box(
-                                    modifier = Modifier
-                                        .size(32.dp)
-                                        .clip(CircleShape)
-                                        .background(
-                                            if (isBoldActive) MaterialTheme.colorScheme.primary.copy(alpha = 0.25f)
-                                            else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)
-                                        )
-                                        .clickable {
-                                            isBoldActive = !isBoldActive
-                                            onFormatClick("**", isBoldActive)
-                                        }
-                                        .testTag("format_bold_btn"),
-                                    contentAlignment = Alignment.Center
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.Default.FormatBold,
-                                        contentDescription = "Format Bold",
-                                        tint = if (isBoldActive) MaterialTheme.colorScheme.primary else onDialogText.copy(alpha = 0.7f),
-                                        modifier = Modifier.size(18.dp)
-                                    )
-                                }
-
-                                // Italic Toggle Button
-                                Box(
-                                    modifier = Modifier
-                                        .size(32.dp)
-                                        .clip(CircleShape)
-                                        .background(
-                                            if (isItalicActive) MaterialTheme.colorScheme.primary.copy(alpha = 0.25f)
-                                            else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)
-                                        )
-                                        .clickable {
-                                            isItalicActive = !isItalicActive
-                                            onFormatClick("*", isItalicActive)
-                                        }
-                                        .testTag("format_italic_btn"),
-                                    contentAlignment = Alignment.Center
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.Default.FormatItalic,
-                                        contentDescription = "Format Italic",
-                                        tint = if (isItalicActive) MaterialTheme.colorScheme.primary else onDialogText.copy(alpha = 0.7f),
-                                        modifier = Modifier.size(18.dp)
-                                    )
-                                }
-
-                                // Underline Toggle Button
-                                Box(
-                                    modifier = Modifier
-                                        .size(32.dp)
-                                        .clip(CircleShape)
-                                        .background(
-                                            if (isUnderlineActive) MaterialTheme.colorScheme.primary.copy(alpha = 0.25f)
-                                            else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)
-                                        )
-                                        .clickable {
-                                            isUnderlineActive = !isUnderlineActive
-                                            onFormatClick("__", isUnderlineActive)
-                                        }
-                                        .testTag("format_underline_btn"),
-                                    contentAlignment = Alignment.Center
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.Default.FormatUnderlined,
-                                        contentDescription = "Format Underline",
-                                        tint = if (isUnderlineActive) MaterialTheme.colorScheme.primary else onDialogText.copy(alpha = 0.7f),
-                                        modifier = Modifier.size(18.dp)
-                                    )
-                                }
-                            }
-                        }
-                        Spacer(modifier = Modifier.height(10.dp))
-                    }
 
                     // Category selection header & row
                     Text(
@@ -5594,8 +6859,13 @@ fun NoteEditorDialog(
                                         modifier = Modifier.size(12.dp),
                                         tint = MaterialTheme.colorScheme.primary
                                     )
+                                    val schedDetailLabel = if (repeatFrequency.equals("minutes", ignoreCase = true)) {
+                                        "Every ${repeatIntervalMinutes}m • " + java.text.SimpleDateFormat("MMM dd, HH:mm", java.util.Locale.getDefault()).format(java.util.Date(scheduledTime!!))
+                                    } else {
+                                        java.text.SimpleDateFormat("MMM dd, HH:mm", java.util.Locale.getDefault()).format(java.util.Date(scheduledTime!!))
+                                    }
                                     Text(
-                                        text = java.text.SimpleDateFormat("MMM dd, HH:mm", java.util.Locale.getDefault()).format(java.util.Date(scheduledTime!!)),
+                                        text = schedDetailLabel,
                                         style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
                                         color = MaterialTheme.colorScheme.primary
                                     )
@@ -5636,9 +6906,12 @@ fun NoteEditorDialog(
                                     isTitleError = true
                                 } else {
                                     keyboardController?.hide()
+                                    val finalContent = if (isTaskList) content else com.example.ui.RichTextHelper.serializeFormattedText(
+                                        contentValue.text, boldSpans, italicSpans, underlineSpans
+                                    ).trim()
                                     onSave(
                                         title.trim(),
-                                        if (isTaskList) content else content.trim(),
+                                        finalContent,
                                         selectedCategory,
                                         selectedColorIndex,
                                         isPinned,
@@ -5648,6 +6921,8 @@ fun NoteEditorDialog(
                                         isScheduled,
                                         scheduledTime,
                                         repeatFrequency,
+                                        repeatIntervalMinutes,
+                                        repeatUntilTime,
                                         selectedTags.joinToString("|"),
                                         if (selectedAutoTags.isNotEmpty()) selectedAutoTags.joinToString("|") else null,
                                         attachmentUri,
@@ -5689,46 +6964,23 @@ fun NoteEditorDialog(
 
 @Composable
 fun parseMarkdownToAnnotatedString(text: String): androidx.compose.ui.text.AnnotatedString {
+    val richState = com.example.ui.RichTextHelper.parseFormattedText(text)
     return androidx.compose.ui.text.buildAnnotatedString {
-        var i = 0
-        while (i < text.length) {
-            if (text.startsWith("**", i)) {
-                val end = text.indexOf("**", i + 2)
-                if (end != -1) {
-                    pushStyle(androidx.compose.ui.text.SpanStyle(fontWeight = FontWeight.Bold))
-                    append(text.substring(i + 2, end))
-                    pop()
-                    i = end + 2
-                } else {
-                    append("**")
-                    i += 2
-                }
-            } else if (text.startsWith("__", i)) {
-                val end = text.indexOf("__", i + 2)
-                if (end != -1) {
-                    pushStyle(androidx.compose.ui.text.SpanStyle(textDecoration = androidx.compose.ui.text.style.TextDecoration.Underline))
-                    append(text.substring(i + 2, end))
-                    pop()
-                    i = end + 2
-                } else {
-                    append("__")
-                    i += 2
-                }
-            } else if (text.startsWith("*", i)) {
-                val end = text.indexOf("*", i + 1)
-                if (end != -1) {
-                    pushStyle(androidx.compose.ui.text.SpanStyle(fontStyle = androidx.compose.ui.text.font.FontStyle.Italic))
-                    append(text.substring(i + 1, end))
-                    pop()
-                    i = end + 1
-                } else {
-                    append("*")
-                    i += 1
-                }
-            } else {
-                append(text[i])
-                i++
-            }
+        append(richState.plainText)
+        richState.boldRanges.forEach { range ->
+            val s = range.first.coerceIn(0, length)
+            val e = range.last.coerceIn(0, length)
+            if (s < e) addStyle(androidx.compose.ui.text.SpanStyle(fontWeight = FontWeight.Bold), s, e)
+        }
+        richState.italicRanges.forEach { range ->
+            val s = range.first.coerceIn(0, length)
+            val e = range.last.coerceIn(0, length)
+            if (s < e) addStyle(androidx.compose.ui.text.SpanStyle(fontStyle = androidx.compose.ui.text.font.FontStyle.Italic), s, e)
+        }
+        richState.underlineRanges.forEach { range ->
+            val s = range.first.coerceIn(0, length)
+            val e = range.last.coerceIn(0, length)
+            if (s < e) addStyle(androidx.compose.ui.text.SpanStyle(textDecoration = androidx.compose.ui.text.style.TextDecoration.Underline), s, e)
         }
     }
 }

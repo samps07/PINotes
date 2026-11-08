@@ -1,0 +1,94 @@
+name: Build and Release Android APK
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Build & Release APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 9.3.1
+
+      - name: Prepare Environment and Keystore
+        run: |
+          # Ensure .env exists so secrets plugin does not complain
+          if [ ! -f .env ] && [ -f .env.example ]; then
+            cp .env.example .env
+            echo ".env created from .env.example"
+          fi
+
+          # Decode debug.keystore if missing from gitignore
+          if [ ! -f debug.keystore ] && [ -f debug.keystore.base64 ]; then
+            base64 -d debug.keystore.base64 > debug.keystore
+            echo "debug.keystore restored from base64"
+          fi
+
+      - name: Build Debug APK
+        run: gradle :app:assembleDebug
+
+      - name: Prepare APK for Release
+        run: |
+          BUILD_NUM="${{ github.run_number }}"
+          APK_DIR="app/build/outputs/apk/debug"
+          ORIGINAL_APK="$APK_DIR/app-debug.apk"
+          RENAMED_APK="$APK_DIR/PinNotes-debug-v${BUILD_NUM}.apk"
+
+          if [ -f "$ORIGINAL_APK" ]; then
+            cp "$ORIGINAL_APK" "$RENAMED_APK"
+            echo "APK prepared: $RENAMED_APK"
+          else
+            echo "Error: $ORIGINAL_APK not found!"
+            ls -la "$APK_DIR"
+            exit 1
+          fi
+
+      - name: Upload APK as Workflow Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PinNotes-debug-v${{ github.run_number }}
+          path: app/build/outputs/apk/debug/PinNotes-debug-v${{ github.run_number }}.apk
+          retention-days: 30
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.${{ github.run_number }}
+          name: "PinNotes v1.0 (Build #${{ github.run_number }})"
+          body: |
+            ### Automated Android APK Release
+            
+            - **Commit**: `${{ github.sha }}`
+            - **Branch/Tag**: `${{ github.ref_name }}`
+            - **Triggered By**: `${{ github.event_name }}`
+            - **Installable File**: Download `PinNotes-debug-v${{ github.run_number }}.apk` below and install it directly onto your Android device.
+          draft: false
+          prerelease: false
+          files: |
+            app/build/outputs/apk/debug/PinNotes-debug-v${{ github.run_number }}.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

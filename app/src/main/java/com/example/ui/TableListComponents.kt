@@ -195,16 +195,20 @@ fun TableListNoteComponent(
             val needsHScroll = totalTableWidth > availableWidth
             val uncheckedTableWidth = if (needsHScroll) totalTableWidth else null
 
-            Surface(
+            Column(
                 modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(12.dp),
-                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.20f),
-                border = BorderStroke(1.dp, gridLineColor)
+                verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
-                val tableContent: @Composable () -> Unit = {
-                    Column(
-                        modifier = if (uncheckedTableWidth != null) Modifier.width(uncheckedTableWidth) else Modifier.fillMaxWidth()
-                    ) {
+                Surface(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(12.dp),
+                    color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.20f),
+                    border = BorderStroke(1.dp, gridLineColor)
+                ) {
+                    val tableContent: @Composable () -> Unit = {
+                        Column(
+                            modifier = if (uncheckedTableWidth != null) Modifier.width(uncheckedTableWidth) else Modifier.fillMaxWidth()
+                        ) {
                         // Header Row
                         if (headers.isNotEmpty()) {
                             Row(
@@ -770,6 +774,7 @@ fun TableListNoteComponent(
             }
         }
     }
+}
 
     // --- Column Header Management Dialog ---
     if (showColumnConfigDialog) {

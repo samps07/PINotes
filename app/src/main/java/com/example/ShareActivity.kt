@@ -176,18 +176,18 @@ class ShareActivity : ComponentActivity() {
                 com.example.data.BackgroundCurationManager.startCuration(this@ShareActivity, finalNote.id, webUrl)
             }
 
-            if (finalNote.isPersistentNotification) {
+            val now = System.currentTimeMillis()
+            if (isScheduled && scheduledTime != null) {
+                if (scheduledTime > now) {
+                    androidx.core.app.NotificationManagerCompat.from(this@ShareActivity).cancel(finalNote.id)
+                    NotificationScheduler.schedule(this@ShareActivity, finalNote)
+                } else {
+                    MainActivity.companionPushNoteNotification(this@ShareActivity, finalNote)
+                }
+            } else if (finalNote.isPersistentNotification) {
                 MainActivity.companionPushNoteNotification(this@ShareActivity, finalNote)
             }
-            if (isScheduled && scheduledTime != null) {
-                if (scheduledTime <= System.currentTimeMillis()) {
-                    if (!finalNote.isPersistentNotification) {
-                        MainActivity.companionPushNoteNotification(this@ShareActivity, finalNote)
-                    }
-                } else {
-                    NotificationScheduler.schedule(this@ShareActivity, finalNote)
-                }
-            }
+            com.example.widget.NotesWidgetProvider.updateAllWidgets(this@ShareActivity)
             Toast.makeText(this@ShareActivity, "Note created with attachment!", Toast.LENGTH_SHORT).show()
             finish()
         }

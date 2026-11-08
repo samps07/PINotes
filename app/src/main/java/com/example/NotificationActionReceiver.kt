@@ -56,26 +56,9 @@ class NotificationActionReceiver : BroadcastReceiver() {
                         val replyText = remoteInputResults?.getCharSequence("key_note_reply")?.toString()?.trim()
                         if (!replyText.isNullOrEmpty()) {
                             val updatedNote = if (note.isTaskList) {
-                                val items = parseTaskItems(note.content).toMutableList()
-                                val rawInt = replyText.toIntOrNull()
-                                val cleanReply = replyText.removePrefix("/").trim()
-                                val slashInt = cleanReply.toIntOrNull()
-                                val matchedIndex = if (rawInt != null) {
-                                    rawInt - 1
-                                } else if (slashInt != null) {
-                                    slashInt - 1
-                                } else {
-                                    items.indexOfFirst { it.text.equals(replyText, ignoreCase = true) }
-                                }
-
-                                if (matchedIndex >= 0 && matchedIndex < items.size) {
-                                    val currentItem = items[matchedIndex]
-                                    items[matchedIndex] = currentItem.copy(isChecked = !currentItem.isChecked)
-                                } else {
-                                    items.add(com.example.data.TaskItem(replyText, false))
-                                }
+                                val newContent = com.example.data.addTaskItemToContent(note.content, replyText)
                                 note.copy(
-                                    content = serializeTaskItems(items),
+                                    content = newContent,
                                     timestamp = System.currentTimeMillis()
                                 )
                             } else {
@@ -85,23 +68,22 @@ class NotificationActionReceiver : BroadcastReceiver() {
                                 )
                             }
                             noteDao.updateNote(updatedNote)
+                            com.example.sync.SyncManager.triggerSyncNow(context, com.example.data.NoteRepository(noteDao))
                             MainActivity.companionPushNoteNotification(context, updatedNote)
+                            com.example.widget.NotesWidgetProvider.updateAllWidgets(context)
                         }
-                    } else {
+                    } else if (intent.action == "com.example.ACTION_TOGGLE_ITEM" || intent.hasExtra("item_index")) {
                         val itemIndex = intent.getIntExtra("item_index", -1)
                         if (note.isTaskList && itemIndex != -1) {
-                            val items = parseTaskItems(note.content).toMutableList()
-                            if (itemIndex >= 0 && itemIndex < items.size) {
-                                val current = items[itemIndex]
-                                items[itemIndex] = current.copy(isChecked = !current.isChecked)
-                                
-                                val updatedNote = note.copy(
-                                    content = serializeTaskItems(items),
-                                    timestamp = System.currentTimeMillis()
-                                )
-                                noteDao.updateNote(updatedNote)
-                                MainActivity.companionPushNoteNotification(context, updatedNote)
-                            }
+                            val newContent = com.example.data.toggleTaskItemChecked(note.content, itemIndex)
+                            val updatedNote = note.copy(
+                                content = newContent,
+                                timestamp = System.currentTimeMillis()
+                            )
+                            noteDao.updateNote(updatedNote)
+                            com.example.sync.SyncManager.triggerSyncNow(context, com.example.data.NoteRepository(noteDao))
+                            MainActivity.companionPushNoteNotification(context, updatedNote)
+                            com.example.widget.NotesWidgetProvider.updateAllWidgets(context)
                         }
                     }
                 }

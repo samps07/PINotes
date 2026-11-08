@@ -223,29 +223,32 @@ object SyncManager {
             val contentResolver = context.contentResolver
             
             // Reconstruct / read file metadata
-            var name = "file_${System.currentTimeMillis()}"
+            var name = "img_${System.currentTimeMillis()}.jpg"
             var size = 0L
-            try {
-                val cursor = contentResolver.query(uri, null, null, null, null)
-                if (cursor != null && cursor.moveToFirst()) {
-                    val nameIndex = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
-                    val sizeIndex = cursor.getColumnIndex(android.provider.OpenableColumns.SIZE)
-                    if (nameIndex != -1) {
-                        name = cursor.getString(nameIndex) ?: name
+            if (localUriStr.startsWith("content://")) {
+                try {
+                    val cursor = contentResolver.query(uri, null, null, null, null)
+                    if (cursor != null && cursor.moveToFirst()) {
+                        val nameIndex = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+                        val sizeIndex = cursor.getColumnIndex(android.provider.OpenableColumns.SIZE)
+                        if (nameIndex != -1) {
+                            name = cursor.getString(nameIndex) ?: name
+                        }
+                        if (sizeIndex != -1) {
+                            size = cursor.getLong(sizeIndex)
+                        }
+                        cursor.close()
                     }
-                    if (sizeIndex != -1) {
-                        size = cursor.getLong(sizeIndex)
-                    }
-                    cursor.close()
-                } else {
+                } catch (e: Exception) {
                     val file = java.io.File(uri.path ?: localUriStr)
                     if (file.exists()) {
                         name = file.name
                         size = file.length()
                     }
                 }
-            } catch (e: Exception) {
-                val file = java.io.File(uri.path ?: localUriStr)
+            } else {
+                val filePath = if (localUriStr.startsWith("file://")) localUriStr.removePrefix("file://") else (uri.path ?: localUriStr)
+                val file = java.io.File(filePath)
                 if (file.exists()) {
                     name = file.name
                     size = file.length()
@@ -262,9 +265,15 @@ object SyncManager {
             }
             
             val inputStream: java.io.InputStream = try {
-                contentResolver.openInputStream(uri)
+                if (localUriStr.startsWith("file://") || !localUriStr.startsWith("content://")) {
+                    val filePath = if (localUriStr.startsWith("file://")) localUriStr.removePrefix("file://") else (uri.path ?: localUriStr)
+                    val f = java.io.File(filePath)
+                    if (f.exists() && f.length() > 0) f.inputStream() else contentResolver.openInputStream(uri)
+                } else {
+                    contentResolver.openInputStream(uri)
+                }
             } catch (e: Exception) {
-                val f = java.io.File(uri.path ?: localUriStr)
+                val f = java.io.File(uri.path ?: localUriStr.removePrefix("file://"))
                 if (f.exists()) f.inputStream() else null
             } ?: return null
             
@@ -324,23 +333,26 @@ object SyncManager {
             val contentResolver = context.contentResolver
             
             // Reconstruct / read file name
-            var name = "file_${System.currentTimeMillis()}"
-            try {
-                val cursor = contentResolver.query(uri, null, null, null, null)
-                if (cursor != null && cursor.moveToFirst()) {
-                    val nameIndex = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
-                    if (nameIndex != -1) {
-                        name = cursor.getString(nameIndex) ?: name
+            var name = "img_${System.currentTimeMillis()}.jpg"
+            if (localUriStr.startsWith("content://")) {
+                try {
+                    val cursor = contentResolver.query(uri, null, null, null, null)
+                    if (cursor != null && cursor.moveToFirst()) {
+                        val nameIndex = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+                        if (nameIndex != -1) {
+                            name = cursor.getString(nameIndex) ?: name
+                        }
+                        cursor.close()
                     }
-                    cursor.close()
-                } else {
+                } catch (e: Exception) {
                     val file = java.io.File(uri.path ?: localUriStr)
                     if (file.exists()) {
                         name = file.name
                     }
                 }
-            } catch (e: Exception) {
-                val file = java.io.File(uri.path ?: localUriStr)
+            } else {
+                val filePath = if (localUriStr.startsWith("file://")) localUriStr.removePrefix("file://") else (uri.path ?: localUriStr)
+                val file = java.io.File(filePath)
                 if (file.exists()) {
                     name = file.name
                 }
@@ -354,9 +366,15 @@ object SyncManager {
             Log.d("SyncManager", "Image upload start: Path format users/$uid/notes/$noteId/images/$filename starting for noteId $noteId")
             
             val inputStream = try {
-                contentResolver.openInputStream(uri)
+                if (localUriStr.startsWith("file://") || !localUriStr.startsWith("content://")) {
+                    val filePath = if (localUriStr.startsWith("file://")) localUriStr.removePrefix("file://") else (uri.path ?: localUriStr)
+                    val f = java.io.File(filePath)
+                    if (f.exists() && f.length() > 0) f.inputStream() else contentResolver.openInputStream(uri)
+                } else {
+                    contentResolver.openInputStream(uri)
+                }
             } catch (e: Exception) {
-                val f = java.io.File(uri.path ?: localUriStr)
+                val f = java.io.File(uri.path ?: localUriStr.removePrefix("file://"))
                 if (f.exists()) f.inputStream() else null
             } ?: return null
             val storageRef = storage.reference.child(storagePath)
@@ -439,17 +457,7 @@ object SyncManager {
                 
                 val finalImageUris = mutableListOf<String>()
                 for (imgUri in imageUrisToSync) {
-                    if (!imgUri.startsWith("http://") && !imgUri.startsWith("https://")) {
-                        // Needs upload
-                        val att = uploadAndCreateAttachment(context, localNote.noteId, imgUri, storage, userId)
-                        if (att != null) {
-                            newAttachments.add(att)
-                            finalImageUris.add(att.downloadUrl) // Save remote url locally so we know it's synced
-                            attachmentsChanged = true
-                        } else {
-                            finalImageUris.add(imgUri)
-                        }
-                    } else {
+                    if (imgUri.startsWith("http://") || imgUri.startsWith("https://")) {
                         // Keep remote
                         finalImageUris.add(imgUri)
                         val existing = currentLocalAttachments.find { it.downloadUrl == imgUri }
@@ -467,6 +475,25 @@ object SyncManager {
                                     downloadUrl = imgUri
                                 )
                             )
+                        }
+                    } else {
+                        // Check if this local file was previously synced or cached from remote
+                        val existing = currentLocalAttachments.find {
+                            it.downloadUrl == imgUri || imgUri.contains(it.fileName) || (it.storagePath.isNotEmpty() && imgUri.endsWith(it.fileName))
+                        }
+                        if (existing != null && existing.downloadUrl.isNotBlank()) {
+                            finalImageUris.add(existing.downloadUrl)
+                            newAttachments.add(existing)
+                        } else {
+                            // Needs upload to Firebase Storage
+                            val att = uploadAndCreateAttachment(context, localNote.noteId, imgUri, storage, userId)
+                            if (att != null) {
+                                newAttachments.add(att)
+                                finalImageUris.add(att.downloadUrl) // Save remote url locally so we know it's synced
+                                attachmentsChanged = true
+                            } else {
+                                finalImageUris.add(imgUri)
+                            }
                         }
                     }
                 }
@@ -619,6 +646,12 @@ object SyncManager {
                             } else {
                                 // Apply remote deletion locally
                                 noteRepository.updateFromSync(updatedLocalNote.copy(deletedAt = remoteNote.deletedAt, updatedAt = remoteNote.updatedAt))
+                                try {
+                                    com.example.NotificationScheduler.cancel(context, updatedLocalNote.id)
+                                    androidx.core.app.NotificationManagerCompat.from(context).cancel(updatedLocalNote.id)
+                                } catch (e: Exception) {
+                                    e.printStackTrace()
+                                }
                             }
                         } else if (localIsDeleted && remoteIsDeleted) {
                             // Both deleted -> sync deletion state to Firestore
@@ -652,6 +685,12 @@ object SyncManager {
                                 }
                                 val downloaded = finalRemoteNote.copy(id = localNote.id)
                                 noteRepository.updateFromSync(downloaded)
+                                preCacheNoteImages(context, downloaded)
+                                if (downloaded.isScheduled && downloaded.scheduledTime != null) {
+                                    com.example.NotificationScheduler.schedule(context, downloaded)
+                                } else {
+                                    com.example.NotificationScheduler.cancel(context, downloaded.id)
+                                }
                             }
                         }
                     }
@@ -665,7 +704,12 @@ object SyncManager {
                 if (!existsLocally) {
                     val remoteNote = remoteDoc.data?.toNote(context, localId = 0) ?: continue
                     if (remoteNote.deletedAt == null) {
-                        noteRepository.insertFromSync(remoteNote)
+                        val newId = noteRepository.insertFromSync(remoteNote)
+                        val insertedNote = remoteNote.copy(id = newId.toInt())
+                        preCacheNoteImages(context, insertedNote)
+                        if (insertedNote.isScheduled && insertedNote.scheduledTime != null) {
+                            com.example.NotificationScheduler.schedule(context, insertedNote)
+                        }
                     }
                 }
             }
@@ -731,6 +775,43 @@ object SyncManager {
     }
 
     /**
+     * Pre-cache image attachments for downloaded notes in background
+     */
+    fun preCacheNoteImages(context: Context, note: Note) {
+        val atts = AttachmentCacheManager.deserializeAttachments(note.attachmentsJson)
+        for (att in atts) {
+            if (att.mimeType.startsWith("image/") && att.downloadUrl.isNotBlank()) {
+                val cached = AttachmentCacheManager.getLocalCacheFile(context, note.noteId, att.fileName)
+                if (!cached.exists() || cached.length() == 0L) {
+                    scope.launch {
+                        try {
+                            AttachmentCacheManager.downloadAttachmentOnDemand(context, note.noteId, att.fileName, att.downloadUrl)
+                        } catch (e: Exception) {
+                            Log.w("SyncManager", "Pre-cache failed for ${att.fileName}: ${e.message}")
+                        }
+                    }
+                }
+            }
+        }
+        if (!note.imageUrl.isNullOrEmpty()) {
+            val urls = note.imageUrl.split("|").filter { it.startsWith("http://") || it.startsWith("https://") }
+            for (url in urls) {
+                val fileName = Uri.parse(url).lastPathSegment ?: "img_${System.currentTimeMillis()}.jpg"
+                val cached = AttachmentCacheManager.getLocalCacheFile(context, note.noteId, fileName)
+                if (!cached.exists() || cached.length() == 0L) {
+                    scope.launch {
+                        try {
+                            AttachmentCacheManager.downloadAttachmentOnDemand(context, note.noteId, fileName, url)
+                        } catch (e: Exception) {
+                            // Ignore
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /**
      * Set up realtime Firestore remote listener
      */
     private fun startRealtimeListener(context: Context, app: FirebaseApp, userId: String, noteRepository: NoteRepository) {
@@ -744,6 +825,14 @@ object SyncManager {
 fun Note.toFirestoreMap(): Map<String, Any?> {
     val attachments = AttachmentCacheManager.deserializeAttachments(attachmentsJson)
     val attachmentsMapList = AttachmentCacheManager.listToMapList(attachments)
+    val finalImageUrl = if (!imageUrl.isNullOrEmpty()) imageUrl else {
+        val imgAtts = attachments.filter { it.mimeType.startsWith("image/") }
+        if (imgAtts.isNotEmpty()) imgAtts.joinToString("|") { it.downloadUrl } else null
+    }
+    val finalImageStoragePath = if (!imageStoragePath.isNullOrEmpty()) imageStoragePath else {
+        val imgAtts = attachments.filter { it.mimeType.startsWith("image/") }
+        if (imgAtts.isNotEmpty()) imgAtts.joinToString("|") { it.storagePath } else null
+    }
     return mapOf(
         "noteId" to noteId,
         "title" to title,
@@ -758,14 +847,16 @@ fun Note.toFirestoreMap(): Map<String, Any?> {
         "isScheduled" to isScheduled,
         "scheduledTime" to scheduledTime,
         "repeatFrequency" to repeatFrequency,
+        "repeatIntervalMinutes" to repeatIntervalMinutes,
+        "repeatUntilTime" to repeatUntilTime,
         "position" to position,
         "tags" to tags,
         "autoTags" to autoTags,
         "createdAt" to createdAt,
         "updatedAt" to updatedAt,
         "deletedAt" to deletedAt,
-        "imageUrl" to imageUrl,
-        "imageStoragePath" to imageStoragePath,
+        "imageUrl" to finalImageUrl,
+        "imageStoragePath" to finalImageStoragePath,
         "isPersistentNotification" to isPersistentNotification,
         "isArchived" to isArchived
     )
@@ -811,7 +902,13 @@ fun Map<String, Any?>.toNote(context: Context, localId: Int = 0): Note {
     val imageUriSec = if (imageAttachments.isNotEmpty()) {
         imageAttachments.map { att ->
             val cachedFile = AttachmentCacheManager.getLocalCacheFile(context, (this["noteId"] as? String) ?: "", att.fileName)
-            Uri.fromFile(cachedFile).toString()
+            if (cachedFile.exists() && cachedFile.length() > 0) {
+                Uri.fromFile(cachedFile).toString()
+            } else if (att.downloadUrl.isNotBlank()) {
+                att.downloadUrl
+            } else {
+                Uri.fromFile(cachedFile).toString()
+            }
         }.joinToString("|")
     } else imageUrlSec
     
@@ -836,6 +933,8 @@ fun Map<String, Any?>.toNote(context: Context, localId: Int = 0): Note {
         isScheduled = (this["isScheduled"] as? Boolean) ?: false,
         scheduledTime = (this["scheduledTime"] as? Long),
         repeatFrequency = (this["repeatFrequency"] as? String),
+        repeatIntervalMinutes = (this["repeatIntervalMinutes"] as? Long)?.toInt(),
+        repeatUntilTime = (this["repeatUntilTime"] as? Long),
         position = (this["position"] as? Long)?.toInt() ?: 0,
         tags = (this["tags"] as? String),
         autoTags = (this["autoTags"] as? String),
