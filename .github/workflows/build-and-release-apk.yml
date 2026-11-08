@@ -7,6 +7,7 @@ on:
       - master
     tags:
       - 'v*'
+      - 'PINotes*'
   workflow_dispatch:
 
 permissions:
@@ -36,31 +37,73 @@ jobs:
 
       - name: Prepare Environment and Keystore
         run: |
-          # Ensure .env exists so secrets plugin does not complain
+          # 1. Ensure .env exists so secrets plugin does not fail
           if [ ! -f .env ] && [ -f .env.example ]; then
             cp .env.example .env
             echo ".env created from .env.example"
           fi
 
-          # Decode debug.keystore if missing from gitignore
+          # 2. Decode debug.keystore from base64 if present in repo
           if [ ! -f debug.keystore ] && [ -f debug.keystore.base64 ]; then
-            base64 -d debug.keystore.base64 > debug.keystore
-            echo "debug.keystore restored from base64"
+            (base64 --decode debug.keystore.base64 > debug.keystore || base64 -d debug.keystore.base64 > debug.keystore) 2>/dev/null || true
+            if [ -s debug.keystore ]; then
+              echo "debug.keystore restored from debug.keystore.base64"
+            fi
           fi
+
+          # 3. If debug.keystore is still missing or empty, generate a valid debug keystore
+          if [ ! -f debug.keystore ] || [ ! -s debug.keystore ]; then
+            echo "Generating debug.keystore using keytool..."
+            keytool -genkeypair -v -keystore debug.keystore \
+              -storepass android \
+              -alias androiddebugkey \
+              -keypass android \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+          fi
+
+          # 4. Verify debug.keystore exists and is valid
+          if [ -s debug.keystore ]; then
+            echo "SUCCESS: debug.keystore verified ($(wc -c < debug.keystore) bytes)"
+          else
+            echo "ERROR: debug.keystore could not be verified!"
+            exit 1
+          fi
+
+          # 5. Extract App Version for release tagging
+          APP_VERSION=$(grep -oP 'versionName\s*=\s*"\K[^"]+' app/build.gradle.kts || echo "1.0")
+          BUILD_NUM="${{ github.run_number }}"
+          
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            RELEASE_TAG="${GITHUB_REF#refs/tags/}"
+          else
+            RELEASE_TAG="PINotes-v${APP_VERSION}.${BUILD_NUM}"
+          fi
+          
+          RELEASE_TITLE="PINotes v${APP_VERSION} (Build #${BUILD_NUM})"
+          
+          echo "APP_VERSION=$APP_VERSION" >> $GITHUB_ENV
+          echo "RELEASE_TAG=$RELEASE_TAG" >> $GITHUB_ENV
+          echo "RELEASE_TITLE=$RELEASE_TITLE" >> $GITHUB_ENV
+          echo "Release configured -> Tag: $RELEASE_TAG, Title: $RELEASE_TITLE"
 
       - name: Build Debug APK
         run: gradle :app:assembleDebug
 
       - name: Prepare APK for Release
         run: |
-          BUILD_NUM="${{ github.run_number }}"
           APK_DIR="app/build/outputs/apk/debug"
           ORIGINAL_APK="$APK_DIR/app-debug.apk"
-          RENAMED_APK="$APK_DIR/PinNotes-debug-v${BUILD_NUM}.apk"
+          VERSIONED_APK="$APK_DIR/PINotes-v${{ env.APP_VERSION }}.apk"
+          BUILD_APK="$APK_DIR/PINotes-v${{ env.APP_VERSION }}-build${{ github.run_number }}.apk"
 
           if [ -f "$ORIGINAL_APK" ]; then
-            cp "$ORIGINAL_APK" "$RENAMED_APK"
-            echo "APK prepared: $RENAMED_APK"
+            cp "$ORIGINAL_APK" "$VERSIONED_APK"
+            cp "$ORIGINAL_APK" "$BUILD_APK"
+            echo "APKs prepared for release:"
+            ls -la "$APK_DIR"/*.apk
           else
             echo "Error: $ORIGINAL_APK not found!"
             ls -la "$APK_DIR"
@@ -70,25 +113,31 @@ jobs:
       - name: Upload APK as Workflow Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: PinNotes-debug-v${{ github.run_number }}
-          path: app/build/outputs/apk/debug/PinNotes-debug-v${{ github.run_number }}.apk
+          name: PINotes-v${{ env.APP_VERSION }}-build${{ github.run_number }}
+          path: |
+            app/build/outputs/apk/debug/PINotes-v${{ env.APP_VERSION }}.apk
+            app/build/outputs/apk/debug/PINotes-v${{ env.APP_VERSION }}-build${{ github.run_number }}.apk
           retention-days: 30
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v1.0.${{ github.run_number }}
-          name: "PinNotes v1.0 (Build #${{ github.run_number }})"
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: ${{ env.RELEASE_TITLE }}
           body: |
-            ### Automated Android APK Release
+            ### 📌 PINotes Automated APK Release
             
+            - **App Version**: `v${{ env.APP_VERSION }}`
+            - **Build**: `#${{ github.run_number }}`
             - **Commit**: `${{ github.sha }}`
             - **Branch/Tag**: `${{ github.ref_name }}`
-            - **Triggered By**: `${{ github.event_name }}`
-            - **Installable File**: Download `PinNotes-debug-v${{ github.run_number }}.apk` below and install it directly onto your Android device.
+            
+            #### 📱 Direct Installation:
+            Download **`PINotes-v${{ env.APP_VERSION }}.apk`** below directly onto your Android device to install or update PINotes.
           draft: false
           prerelease: false
           files: |
-            app/build/outputs/apk/debug/PinNotes-debug-v${{ github.run_number }}.apk
+            app/build/outputs/apk/debug/PINotes-v${{ env.APP_VERSION }}.apk
+            app/build/outputs/apk/debug/PINotes-v${{ env.APP_VERSION }}-build${{ github.run_number }}.apk
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
