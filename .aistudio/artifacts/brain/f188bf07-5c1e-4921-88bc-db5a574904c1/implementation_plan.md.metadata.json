@@ -1,6 +1,0 @@
-{
-  "summary":  "Implementation plan for setting up automated GitHub Actions CI/CD to build and publish installable Debug APKs directly to GitHub Releases upon every push.",
-  "updatedAt":  "2026-11-08T08:22:01.483304237Z",
-  "requestFeedback":  true,
-  "userFacing":  true
-}

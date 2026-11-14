@@ -5,6 +5,9 @@ on:
     branches:
       - main
       - master
+    paths-ignore:
+      - 'web/**'
+      - '*.md'
     tags:
       - 'v*'
       - 'PINotes*'

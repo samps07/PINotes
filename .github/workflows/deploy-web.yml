@@ -1,0 +1,73 @@
+name: Deploy PINotes Web to GitHub Pages
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - 'web/**'
+      - '.github/workflows/deploy-web.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build Web App
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Setup Pages
+        id: pages
+        uses: actions/configure-pages@v5
+
+      - name: Install Dependencies
+        run: |
+          if [ -f web/package-lock.json ]; then
+            npm --prefix web ci
+          else
+            npm --prefix web install
+          fi
+
+      - name: Build Production Bundle
+        run: |
+          RAW_BASE="${{ steps.pages.outputs.base_path }}"
+          if [ -z "$RAW_BASE" ] || [ "$RAW_BASE" = "/" ]; then
+            export VITE_BASE_PATH="/"
+          else
+            export VITE_BASE_PATH="${RAW_BASE%/}/"
+          fi
+          echo "Building with VITE_BASE_PATH=$VITE_BASE_PATH"
+          npm --prefix web run build
+
+      - name: Upload GitHub Pages Artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: web/dist
+
+  deploy:
+    name: Deploy to GitHub Pages
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

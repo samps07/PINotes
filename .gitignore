@@ -16,3 +16,6 @@
 local.properties
 .env
 debug.keystore
+web/node_modules
+web/dist
+web/.vite
