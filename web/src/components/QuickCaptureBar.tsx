@@ -1,5 +1,14 @@
-import React, { useState, useRef } from 'react';
-import { CheckSquare, Pin, Palette, Plus, Image as ImageIcon } from 'lucide-react';
+import React, { useState, useRef, useEffect } from 'react';
+import {
+  CheckSquare,
+  Pin,
+  Palette,
+  Plus,
+  Image as ImageIcon,
+  X,
+  AlertCircle,
+  Loader2,
+} from 'lucide-react';
 import {
   getNoteColors,
   NOTE_COLORS,
@@ -13,6 +22,11 @@ interface QuickCaptureBarProps {
   categories: string[];
   defaultCategory: string;
   onCreateNote: (draft: Partial<NoteDocument>, filesToUpload?: File[]) => Promise<void>;
+}
+
+interface QueuedImage {
+  file: File;
+  previewUrl: string;
 }
 
 export const QuickCaptureBar: React.FC<QuickCaptureBarProps> = ({
@@ -29,13 +43,39 @@ export const QuickCaptureBar: React.FC<QuickCaptureBarProps> = ({
   const [colorIndex, setColorIndex] = useState(0);
   const [category, setCategory] = useState(defaultCategory || 'General');
   const [showColors, setShowColors] = useState(false);
-  const [queuedImages, setQueuedImages] = useState<File[]>([]);
+  const [queuedImages, setQueuedImages] = useState<QueuedImage[]>([]);
   const [isSaving, setIsSaving] = useState(false);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const colors = getNoteColors(colorIndex, isDark);
 
+  useEffect(() => {
+    setCategory(defaultCategory || 'General');
+  }, [defaultCategory]);
+
+  const addFiles = (files: File[]) => {
+    const valid = files.filter((f) => f.type.startsWith('image/'));
+    if (valid.length === 0) return;
+    const mapped = valid.map((file) => ({
+      file,
+      previewUrl: URL.createObjectURL(file),
+    }));
+    setQueuedImages((prev) => [...prev, ...mapped]);
+    setExpanded(true);
+    setErrorMsg(null);
+  };
+
+  const removeQueuedImage = (idx: number) => {
+    setQueuedImages((prev) => {
+      const target = prev[idx];
+      if (target) URL.revokeObjectURL(target.previewUrl);
+      return prev.filter((_, i) => i !== idx);
+    });
+  };
+
   const reset = () => {
+    queuedImages.forEach((item) => URL.revokeObjectURL(item.previewUrl));
     setExpanded(false);
     setTitle('');
     setContent('');
@@ -45,6 +85,7 @@ export const QuickCaptureBar: React.FC<QuickCaptureBarProps> = ({
     setCategory(defaultCategory || 'General');
     setShowColors(false);
     setQueuedImages([]);
+    setErrorMsg(null);
   };
 
   const handleSave = async () => {
@@ -53,19 +94,24 @@ export const QuickCaptureBar: React.FC<QuickCaptureBarProps> = ({
       return;
     }
     setIsSaving(true);
+    setErrorMsg(null);
     try {
       await onCreateNote(
         {
-          title: title.trim() || 'Untitled Note',
+          title: title.trim() || (queuedImages.length > 0 ? 'Image Note' : 'Untitled Note'),
           content,
           isTaskList,
           isPinned,
           colorIndex,
           category,
         },
-        queuedImages
+        queuedImages.map((q) => q.file)
       );
       reset();
+    } catch (err: unknown) {
+      setErrorMsg(
+        err instanceof Error ? err.message : 'Could not save note. Please try again.'
+      );
     } finally {
       setIsSaving(false);
     }
@@ -81,8 +127,30 @@ export const QuickCaptureBar: React.FC<QuickCaptureBarProps> = ({
     fileInputRef.current?.click();
   };
 
+  const handlePaste = (e: React.ClipboardEvent) => {
+    const items = Array.from(e.clipboardData?.items || []);
+    const pastedImages: File[] = [];
+    for (const item of items) {
+      if (item.type.startsWith('image/')) {
+        const f = item.getAsFile();
+        if (f) pastedImages.push(f);
+      }
+    }
+    if (pastedImages.length > 0) {
+      addFiles(pastedImages);
+    }
+  };
+
   return (
-    <div className="max-w-2xl mx-auto mb-7">
+    <div
+      className="max-w-2xl mx-auto mb-7"
+      onPaste={handlePaste}
+      onDragOver={(e) => e.preventDefault()}
+      onDrop={(e) => {
+        e.preventDefault();
+        addFiles(Array.from(e.dataTransfer.files || []));
+      }}
+    >
       <input
         ref={fileInputRef}
         type="file"
@@ -92,8 +160,7 @@ export const QuickCaptureBar: React.FC<QuickCaptureBarProps> = ({
         onChange={(e) => {
           const files = Array.from(e.target.files || []);
           if (files.length > 0) {
-            setQueuedImages((prev) => [...prev, ...files]);
-            setExpanded(true);
+            addFiles(files);
           }
           e.target.value = '';
         }}
@@ -170,34 +237,43 @@ export const QuickCaptureBar: React.FC<QuickCaptureBarProps> = ({
             <RichTextEditor
               initialValue={content}
               onChange={setContent}
-              placeholder="Take a note..."
+              placeholder="Take a note... (or paste / drop images)"
               textColor={colors.text}
               minHeight="96px"
             />
           )}
 
-          {/* Queued Image Previews */}
+          {/* Queued Image Visual Thumbnail Previews */}
           {queuedImages.length > 0 && (
-            <div className="flex flex-wrap gap-2 pt-1">
-              {queuedImages.map((file, idx) => (
+            <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 pt-1">
+              {queuedImages.map((item, idx) => (
                 <div
                   key={idx}
-                  className="px-2.5 py-1 rounded-xl text-xs border flex items-center gap-1.5 bg-black/20"
+                  className="relative group rounded-2xl overflow-hidden border aspect-[4/3] bg-black/25"
                   style={{ borderColor: 'var(--border-subtle)' }}
                 >
-                  <ImageIcon className="w-3.5 h-3.5" />
-                  <span className="max-w-[140px] truncate">{file.name}</span>
+                  <img
+                    src={item.previewUrl}
+                    alt={item.file.name}
+                    className="w-full h-full object-cover"
+                  />
                   <button
                     type="button"
-                    onClick={() =>
-                      setQueuedImages((prev) => prev.filter((_, i) => i !== idx))
-                    }
-                    className="opacity-70 hover:opacity-100 cursor-pointer"
+                    onClick={() => removeQueuedImage(idx)}
+                    title="Remove image"
+                    className="absolute top-1.5 right-1.5 p-1 rounded-full bg-black/75 text-white hover:bg-black cursor-pointer"
                   >
-                    ×
+                    <X className="w-3.5 h-3.5" />
                   </button>
                 </div>
               ))}
+            </div>
+          )}
+
+          {errorMsg && (
+            <div className="flex items-start gap-2 rounded-xl px-3 py-2 text-xs bg-rose-500/15 text-rose-300 border border-rose-500/30">
+              <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+              <span>{errorMsg}</span>
             </div>
           )}
 
@@ -273,6 +349,7 @@ export const QuickCaptureBar: React.FC<QuickCaptureBarProps> = ({
               <button
                 type="button"
                 onClick={reset}
+                disabled={isSaving}
                 className="px-3 py-1.5 rounded-xl text-xs font-medium hover:bg-white/10 cursor-pointer"
               >
                 Close
@@ -281,14 +358,23 @@ export const QuickCaptureBar: React.FC<QuickCaptureBarProps> = ({
                 type="button"
                 disabled={isSaving}
                 onClick={handleSave}
-                className="inline-flex items-center gap-1 px-4 py-1.5 rounded-xl text-xs font-bold cursor-pointer disabled:opacity-60"
+                className="inline-flex items-center gap-1.5 px-4 py-1.5 rounded-xl text-xs font-bold cursor-pointer disabled:opacity-60"
                 style={{
                   background: 'var(--accent)',
                   color: 'var(--accent-on)',
                 }}
               >
-                <Plus className="w-3.5 h-3.5" />
-                {isSaving ? 'Saving...' : 'Save Note'}
+                {isSaving ? (
+                  <>
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    Saving...
+                  </>
+                ) : (
+                  <>
+                    <Plus className="w-3.5 h-3.5" />
+                    Save Note
+                  </>
+                )}
               </button>
             </div>
           </div>

@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState, useCallback } from 'react';
+import { FirebaseApp } from 'firebase/app';
 import {
   onAuthStateChanged,
   signInWithEmailAndPassword,
@@ -16,6 +17,7 @@ import {
   NoteDocument,
   SidebarSection,
   SyncStatus,
+  WebPasscodeConfig,
 } from './types/note';
 import {
   clearSavedFirebaseConfig,
@@ -35,8 +37,16 @@ import {
   uploadImageForNote,
   deleteStoragePathSafe,
 } from './services/notesService';
+import {
+  loadCachedWebLock,
+  setWebPasscode,
+  subscribeToWebLock,
+  unsetWebPasscode,
+  verifyWebPasscode,
+} from './services/webLockService';
 import { stripRichTagsToPlainText } from './utils/richText';
 import { SetupAuthScreen } from './components/SetupAuthScreen';
+import { PasscodeLockScreen } from './components/PasscodeLockScreen';
 import { TopBar } from './components/TopBar';
 import { Sidebar } from './components/Sidebar';
 import { QuickCaptureBar } from './components/QuickCaptureBar';
@@ -62,10 +72,20 @@ export function App() {
   const [firebaseConfig, setFirebaseConfig] = useState<FirebaseUserConfig | null>(() =>
     loadSavedFirebaseConfig()
   );
+  const [firebaseApp, setFirebaseApp] = useState<FirebaseApp | null>(null);
   const [db, setDb] = useState<Firestore | null>(null);
   const [storage, setStorage] = useState<FirebaseStorage | null>(null);
   const [currentUser, setCurrentUser] = useState<User | null>(null);
   const [booting, setBooting] = useState<boolean>(() => Boolean(loadSavedFirebaseConfig()));
+
+  // Web-only cross-session passcode lock (in-memory unlock resets on every refresh)
+  const [webLock, setWebLock] = useState<WebPasscodeConfig>({
+    enabled: false,
+    passcodeHash: null,
+    updatedAt: 0,
+  });
+  const [webLockLoading, setWebLockLoading] = useState<boolean>(false);
+  const [isWebUnlocked, setIsWebUnlocked] = useState<boolean>(false);
 
   const [notes, setNotes] = useState<NoteDocument[]>([]);
   const [categories, setCategories] = useState<string[]>(DEFAULT_CATEGORIES);
@@ -118,12 +138,22 @@ export function App() {
       try {
         const instances = await getOrInitFirebaseInstances(firebaseConfig);
         if (cancelled) return;
+        setFirebaseApp(instances.app);
         setDb(instances.db);
         setStorage(instances.storage);
 
         unsubAuth = onAuthStateChanged(instances.auth, (user) => {
           if (cancelled) return;
           setCurrentUser(user);
+          if (user) {
+            const cached = loadCachedWebLock(user.uid);
+            if (cached) setWebLock(cached);
+            setWebLockLoading(true);
+          } else {
+            setIsWebUnlocked(false);
+            setWebLock({ enabled: false, passcodeHash: null, updatedAt: 0 });
+            setWebLockLoading(false);
+          }
           setBooting(false);
           setSyncStatus(user ? 'SYNCED' : 'OFFLINE');
         });
@@ -141,7 +171,7 @@ export function App() {
     };
   }, [firebaseConfig]);
 
-  // Subscribe to Firestore notes & preferences when authenticated
+  // Subscribe to Firestore notes, preferences & web security lock when authenticated
   useEffect(() => {
     if (!db || !currentUser) {
       setNotes([]);
@@ -168,9 +198,15 @@ export function App() {
       setTags(tgs);
     });
 
+    const unsubLock = subscribeToWebLock(db, currentUser.uid, (cfg) => {
+      setWebLock(cfg);
+      setWebLockLoading(false);
+    });
+
     return () => {
       unsubNotes();
       unsubPrefs();
+      unsubLock();
     };
   }, [db, currentUser, notify]);
 
@@ -180,7 +216,7 @@ export function App() {
     password: string,
     mode: 'signin' | 'signup'
   ) => {
-    const saved = saveFirebaseConfig(config);
+    const saved = saveFirebaseConfig(config, email);
     const instances = await getOrInitFirebaseInstances(saved);
 
     if (mode === 'signin') {
@@ -189,6 +225,7 @@ export function App() {
       await createUserWithEmailAndPassword(instances.auth, email, password);
     }
 
+    setFirebaseApp(instances.app);
     setDb(instances.db);
     setStorage(instances.storage);
     setFirebaseConfig(saved);
@@ -218,6 +255,8 @@ export function App() {
       await signOut(instances.auth);
     }
     setSettingsOpen(false);
+    setIsWebUnlocked(false);
+    setWebLock({ enabled: false, passcodeHash: null, updatedAt: 0 });
     setCurrentUser(null);
     setNotes([]);
     setSyncStatus('OFFLINE');
@@ -228,8 +267,47 @@ export function App() {
     await teardownFirebaseInstance();
     clearSavedFirebaseConfig();
     setFirebaseConfig(null);
+    setFirebaseApp(null);
     setDb(null);
     setStorage(null);
+  };
+
+  const handleSetWebPasscode = async (passcode: string) => {
+    if (!db || !currentUser) return;
+    const cfg = await setWebPasscode(db, currentUser.uid, passcode);
+    setWebLock(cfg);
+    setIsWebUnlocked(true);
+    notify('Web app passcode lock enabled');
+  };
+
+  const handleResetWebPasscode = async (
+    currentPasscode: string,
+    newPasscode: string
+  ): Promise<boolean> => {
+    if (!db || !currentUser) return false;
+    const ok = await verifyWebPasscode(currentUser.uid, currentPasscode, webLock.passcodeHash);
+    if (!ok) return false;
+    const cfg = await setWebPasscode(db, currentUser.uid, newPasscode);
+    setWebLock(cfg);
+    setIsWebUnlocked(true);
+    notify('Web app passcode updated');
+    return true;
+  };
+
+  const handleUnsetWebPasscode = async (currentPasscode: string): Promise<boolean> => {
+    if (!db || !currentUser) return false;
+    const ok = await verifyWebPasscode(currentUser.uid, currentPasscode, webLock.passcodeHash);
+    if (!ok) return false;
+    const cfg = await unsetWebPasscode(db, currentUser.uid);
+    setWebLock(cfg);
+    setIsWebUnlocked(false);
+    notify('Web app passcode lock removed');
+    return true;
+  };
+
+  const handleLockNow = () => {
+    setSettingsOpen(false);
+    setIsWebUnlocked(false);
   };
 
   const handleCreateNote = async (
@@ -243,12 +321,21 @@ export function App() {
     const uploadedAttachments = [];
     const uploadedUrls: string[] = [];
     const uploadedPaths: string[] = [];
+    let usedInlineFallback = false;
 
     for (const file of filesToUpload) {
-      const res = await uploadImageForNote(storage, currentUser.uid, noteId, file);
+      const res = await uploadImageForNote(
+        storage,
+        currentUser.uid,
+        noteId,
+        file,
+        undefined,
+        firebaseApp
+      );
+      if (res.usedInlineFallback) usedInlineFallback = true;
       uploadedAttachments.push(res.attachment);
       uploadedUrls.push(res.downloadUrl);
-      uploadedPaths.push(res.storagePath);
+      if (res.storagePath) uploadedPaths.push(res.storagePath);
     }
 
     const newNote: NoteDocument = {
@@ -285,7 +372,11 @@ export function App() {
     setSyncStatus('SYNCING');
     await saveNoteToFirestore(db, currentUser.uid, newNote);
     setSyncStatus('SYNCED');
-    notify('Note saved and synced');
+    notify(
+      usedInlineFallback && filesToUpload.length > 0
+        ? 'Image note saved & synced with Firestore'
+        : 'Note saved and synced'
+    );
   };
 
   const handleSaveNote = async (updated: NoteDocument) => {
@@ -470,6 +561,29 @@ export function App() {
     );
   }
 
+  // Gate behind Web Passcode Lock before rendering notes (never flashes notes on refresh)
+  if (webLock.enabled && !isWebUnlocked) {
+    return (
+      <PasscodeLockScreen
+        userEmail={currentUser.email}
+        onVerify={(passcode) =>
+          verifyWebPasscode(currentUser.uid, passcode, webLock.passcodeHash)
+        }
+        onUnlockSuccess={() => setIsWebUnlocked(true)}
+        onSignOut={handleSignOut}
+      />
+    );
+  }
+
+  if (webLockLoading && !isWebUnlocked) {
+    return (
+      <div className="min-h-screen flex flex-col items-center justify-center gap-3">
+        <Loader2 className="w-7 h-7 animate-spin" style={{ color: 'var(--accent)' }} />
+        <p className="text-sm opacity-70">Checking web app lock status...</p>
+      </div>
+    );
+  }
+
   const sectionTitle = () => {
     switch (activeSection.type) {
       case 'notes':
@@ -507,6 +621,8 @@ export function App() {
         onToggleSidebar={() => setSidebarOpen((v) => !v)}
         onOpenSettings={() => setSettingsOpen(true)}
         userEmail={currentUser.email}
+        showLockButton={webLock.enabled}
+        onLockNow={handleLockNow}
       />
 
       <div className="flex flex-1 max-w-[1600px] w-full mx-auto">
@@ -656,7 +772,14 @@ export function App() {
           onClose={() => setEditingNote(null)}
           onSave={handleSaveNote}
           onUploadImage={(noteId, file) =>
-            uploadImageForNote(storage!, currentUser.uid, noteId, file)
+            uploadImageForNote(
+              storage!,
+              currentUser.uid,
+              noteId,
+              file,
+              undefined,
+              firebaseApp
+            )
           }
           onUploadFile={(noteId, file) =>
             uploadFileForNote(storage!, currentUser.uid, noteId, file)
@@ -679,6 +802,11 @@ export function App() {
         config={firebaseConfig}
         userEmail={currentUser.email}
         userUid={currentUser.uid}
+        webLock={webLock}
+        onSetWebPasscode={handleSetWebPasscode}
+        onResetWebPasscode={handleResetWebPasscode}
+        onUnsetWebPasscode={handleUnsetWebPasscode}
+        onLockNow={handleLockNow}
         onManualSync={handleManualSync}
         onSignOut={handleSignOut}
         onForgetConfigAndSignOut={handleForgetConfigAndSignOut}

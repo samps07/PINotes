@@ -45,6 +45,11 @@ jobs:
           fi
 
       - name: Build Production Bundle
+        env:
+          VITE_FIREBASE_API_KEY: ${{ vars.VITE_FIREBASE_API_KEY }}
+          VITE_FIREBASE_PROJECT_ID: ${{ vars.VITE_FIREBASE_PROJECT_ID }}
+          VITE_FIREBASE_APP_ID: ${{ vars.VITE_FIREBASE_APP_ID }}
+          VITE_FIREBASE_STORAGE_BUCKET: ${{ vars.VITE_FIREBASE_STORAGE_BUCKET }}
         run: |
           RAW_BASE="${{ steps.pages.outputs.base_path }}"
           if [ -z "$RAW_BASE" ] || [ "$RAW_BASE" = "/" ]; then

@@ -5,15 +5,16 @@ import {
   Mail,
   Lock,
   Sparkles,
-  ChevronDown,
-  ChevronUp,
   CheckCircle2,
   AlertCircle,
   Loader2,
   ClipboardPaste,
 } from 'lucide-react';
 import { FirebaseUserConfig } from '../types/note';
-import { parseFirebaseConfigSnippet } from '../utils/firebaseClient';
+import {
+  getFirebaseConfigForEmail,
+  parseFirebaseConfigSnippet,
+} from '../utils/firebaseClient';
 
 interface SetupAuthScreenProps {
   initialConfig: FirebaseUserConfig | null;
@@ -38,9 +39,9 @@ export const SetupAuthScreen: React.FC<SetupAuthScreenProps> = ({
   const [appId, setAppId] = useState(initialConfig?.appId || '');
   const [storageBucket, setStorageBucket] = useState(initialConfig?.storageBucket || '');
 
-  const [showConfigSection, setShowConfigSection] = useState(!initialConfig);
   const [showSnippetBox, setShowSnippetBox] = useState(false);
   const [snippetText, setSnippetText] = useState('');
+  const [showManualSignInConfig, setShowManualSignInConfig] = useState(false);
 
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
@@ -48,6 +49,18 @@ export const SetupAuthScreen: React.FC<SetupAuthScreenProps> = ({
   const [isLoading, setIsLoading] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [infoMsg, setInfoMsg] = useState<string | null>(null);
+
+  const handleEmailChange = (val: string) => {
+    setEmail(val);
+    // Automatically load saved Firebase config associated with these login credentials
+    const matched = getFirebaseConfigForEmail(val);
+    if (matched) {
+      setApiKey(matched.apiKey);
+      setProjectId(matched.projectId);
+      setAppId(matched.appId);
+      setStorageBucket(matched.storageBucket);
+    }
+  };
 
   const handleParseSnippet = () => {
     const parsed = parseFirebaseConfigSnippet(snippetText);
@@ -70,13 +83,30 @@ export const SetupAuthScreen: React.FC<SetupAuthScreenProps> = ({
     setErrorMsg(null);
     setInfoMsg(null);
 
-    if (!apiKey.trim() || !projectId.trim() || !appId.trim()) {
-      setShowConfigSection(true);
-      setErrorMsg('Please enter your Firebase API Key, Project ID, and App ID.');
-      return;
-    }
     if (!email.trim() || !password) {
       setErrorMsg('Please enter your email and password.');
+      return;
+    }
+
+    // Resolve saved config for Sign In automatically (no prompt unless completely absent on this device)
+    const savedForEmail = getFirebaseConfigForEmail(email) || initialConfig;
+    const effectiveApiKey = apiKey.trim() || savedForEmail?.apiKey || '';
+    const effectiveProjectId = projectId.trim() || savedForEmail?.projectId || '';
+    const effectiveAppId = appId.trim() || savedForEmail?.appId || '';
+    const effectiveBucket =
+      storageBucket.trim() ||
+      savedForEmail?.storageBucket ||
+      (effectiveProjectId ? `${effectiveProjectId}.firebasestorage.app` : '');
+
+    if (!effectiveApiKey || !effectiveProjectId || !effectiveAppId) {
+      if (authMode === 'signin') {
+        setShowManualSignInConfig(true);
+        setErrorMsg(
+          'No saved Firebase config found on this browser yet. Enter your Firebase project once below (or use a Quick-Login link from your other device).'
+        );
+      } else {
+        setErrorMsg('Please enter your Firebase API Key, Project ID, and App ID to create an account.');
+      }
       return;
     }
 
@@ -84,11 +114,10 @@ export const SetupAuthScreen: React.FC<SetupAuthScreenProps> = ({
     try {
       await onConnect(
         {
-          apiKey: apiKey.trim(),
-          projectId: projectId.trim(),
-          appId: appId.trim(),
-          storageBucket:
-            storageBucket.trim() || `${projectId.trim()}.firebasestorage.app`,
+          apiKey: effectiveApiKey,
+          projectId: effectiveProjectId,
+          appId: effectiveAppId,
+          storageBucket: effectiveBucket,
         },
         email.trim(),
         password,
@@ -102,9 +131,10 @@ export const SetupAuthScreen: React.FC<SetupAuthScreenProps> = ({
     }
   };
 
+  const shouldShowFirebaseForm = authMode === 'signup' || showManualSignInConfig;
+
   return (
     <div className="min-h-screen flex flex-col items-center justify-center p-4 sm:p-6 relative overflow-hidden">
-      {/* Subtle decorative glow */}
       <div
         className="pointer-events-none absolute -top-40 left-1/2 -translate-x-1/2 w-[540px] h-[540px] rounded-full blur-[120px] opacity-20"
         style={{ background: 'var(--accent)' }}
@@ -153,161 +183,6 @@ export const SetupAuthScreen: React.FC<SetupAuthScreenProps> = ({
             borderColor: 'var(--border-subtle)',
           }}
         >
-          {/* Firebase Config Section */}
-          <div
-            className="rounded-2xl border overflow-hidden"
-            style={{
-              background: 'var(--bg-canvas)',
-              borderColor: 'var(--border-subtle)',
-            }}
-          >
-            <button
-              type="button"
-              onClick={() => setShowConfigSection((v) => !v)}
-              className="w-full flex items-center justify-between px-4 py-3 text-left cursor-pointer"
-            >
-              <div className="flex items-center gap-2.5">
-                <Cloud className="w-4 h-4" style={{ color: 'var(--accent)' }} />
-                <div>
-                  <div className="text-sm font-semibold">
-                    Firebase Project Configuration
-                  </div>
-                  <div className="text-xs opacity-65">
-                    {projectId
-                      ? `Connected target: ${projectId}`
-                      : 'Enter the same Firebase config used in your Android app'}
-                  </div>
-                </div>
-              </div>
-              <div className="flex items-center gap-2">
-                {apiKey && projectId && appId && (
-                  <CheckCircle2 className="w-4 h-4 text-emerald-400" />
-                )}
-                {showConfigSection ? (
-                  <ChevronUp className="w-4 h-4 opacity-60" />
-                ) : (
-                  <ChevronDown className="w-4 h-4 opacity-60" />
-                )}
-              </div>
-            </button>
-
-            {showConfigSection && (
-              <div className="px-4 pb-4 pt-1 space-y-3 border-t" style={{ borderColor: 'var(--border-subtle)' }}>
-                <div className="flex items-center justify-between pt-2">
-                  <span className="text-xs opacity-70">
-                    Find these in Android PINotes → Cloud Sync or Firebase Console
-                  </span>
-                  <button
-                    type="button"
-                    onClick={() => setShowSnippetBox((v) => !v)}
-                    className="inline-flex items-center gap-1 text-xs font-medium px-2.5 py-1 rounded-lg cursor-pointer"
-                    style={{
-                      background: 'var(--accent-container)',
-                      color: 'var(--accent-container-text)',
-                    }}
-                  >
-                    <ClipboardPaste className="w-3.5 h-3.5" />
-                    Paste Snippet
-                  </button>
-                </div>
-
-                {showSnippetBox && (
-                  <div className="space-y-2 pt-1">
-                    <textarea
-                      value={snippetText}
-                      onChange={(e) => setSnippetText(e.target.value)}
-                      rows={4}
-                      placeholder={'Paste Firebase config snippet:\nconst firebaseConfig = {\n  apiKey: "...",\n  projectId: "...",\n  appId: "..."\n};'}
-                      className="w-full rounded-xl px-3 py-2 text-xs font-mono border focus:outline-none"
-                      style={{
-                        background: 'var(--bg-surface)',
-                        borderColor: 'var(--border-subtle)',
-                      }}
-                    />
-                    <button
-                      type="button"
-                      onClick={handleParseSnippet}
-                      className="px-3 py-1.5 rounded-xl text-xs font-semibold cursor-pointer"
-                      style={{
-                        background: 'var(--accent)',
-                        color: 'var(--accent-on)',
-                      }}
-                    >
-                      Auto-fill Fields
-                    </button>
-                  </div>
-                )}
-
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
-                  <div>
-                    <label className="block text-[11px] font-medium opacity-70 mb-1">
-                      Project ID *
-                    </label>
-                    <input
-                      type="text"
-                      value={projectId}
-                      onChange={(e) => setProjectId(e.target.value)}
-                      placeholder="my-pinotes-project"
-                      className="w-full rounded-xl px-3 py-2 text-sm border focus:outline-none"
-                      style={{
-                        background: 'var(--bg-surface)',
-                        borderColor: 'var(--border-subtle)',
-                      }}
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-[11px] font-medium opacity-70 mb-1">
-                      API Key *
-                    </label>
-                    <input
-                      type="text"
-                      value={apiKey}
-                      onChange={(e) => setApiKey(e.target.value)}
-                      placeholder="AIzaSy..."
-                      className="w-full rounded-xl px-3 py-2 text-sm border focus:outline-none"
-                      style={{
-                        background: 'var(--bg-surface)',
-                        borderColor: 'var(--border-subtle)',
-                      }}
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-[11px] font-medium opacity-70 mb-1">
-                      App ID *
-                    </label>
-                    <input
-                      type="text"
-                      value={appId}
-                      onChange={(e) => setAppId(e.target.value)}
-                      placeholder="1:123456:web:abcdef"
-                      className="w-full rounded-xl px-3 py-2 text-sm border focus:outline-none"
-                      style={{
-                        background: 'var(--bg-surface)',
-                        borderColor: 'var(--border-subtle)',
-                      }}
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-[11px] font-medium opacity-70 mb-1">
-                      Storage Bucket
-                    </label>
-                    <input
-                      type="text"
-                      value={storageBucket}
-                      onChange={(e) => setStorageBucket(e.target.value)}
-                      placeholder="project.firebasestorage.app"
-                      className="w-full rounded-xl px-3 py-2 text-sm border focus:outline-none"
-                      style={{
-                        background: 'var(--bg-surface)',
-                        borderColor: 'var(--border-subtle)',
-                      }}
-                    />
-                  </div>
-                </div>
-              </div>
-            )}
-          </div>
-
           {/* Auth Mode Tabs */}
           <div
             className="grid grid-cols-2 p-1 rounded-2xl border"
@@ -318,7 +193,10 @@ export const SetupAuthScreen: React.FC<SetupAuthScreenProps> = ({
           >
             <button
               type="button"
-              onClick={() => setAuthMode('signin')}
+              onClick={() => {
+                setAuthMode('signin');
+                setErrorMsg(null);
+              }}
               className="py-2 rounded-xl text-sm font-semibold transition-all cursor-pointer"
               style={
                 authMode === 'signin'
@@ -333,7 +211,10 @@ export const SetupAuthScreen: React.FC<SetupAuthScreenProps> = ({
             </button>
             <button
               type="button"
-              onClick={() => setAuthMode('signup')}
+              onClick={() => {
+                setAuthMode('signup');
+                setErrorMsg(null);
+              }}
               className="py-2 rounded-xl text-sm font-semibold transition-all cursor-pointer"
               style={
                 authMode === 'signup'
@@ -348,6 +229,162 @@ export const SetupAuthScreen: React.FC<SetupAuthScreenProps> = ({
             </button>
           </div>
 
+          {/* Saved Project Indicator on Sign In */}
+          {authMode === 'signin' && !showManualSignInConfig && projectId && (
+            <div
+              className="flex items-center justify-between px-3.5 py-2.5 rounded-2xl border text-xs"
+              style={{
+                background: 'var(--bg-canvas)',
+                borderColor: 'var(--border-subtle)',
+              }}
+            >
+              <span className="flex items-center gap-2 opacity-80">
+                <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+                <span>
+                  Workspace ready: <strong>{projectId}</strong>
+                </span>
+              </span>
+              <button
+                type="button"
+                onClick={() => setShowManualSignInConfig(true)}
+                className="text-[11px] font-medium underline opacity-70 hover:opacity-100 cursor-pointer"
+              >
+                Switch project
+              </button>
+            </div>
+          )}
+
+          {/* Firebase Config Section (Shown automatically only on Create Account, or if missing on new browser) */}
+          {shouldShowFirebaseForm && (
+            <div
+              className="rounded-2xl border overflow-hidden p-4 space-y-3"
+              style={{
+                background: 'var(--bg-canvas)',
+                borderColor: 'var(--border-subtle)',
+              }}
+            >
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex items-center gap-2">
+                  <Cloud className="w-4 h-4 shrink-0" style={{ color: 'var(--accent)' }} />
+                  <div>
+                    <div className="text-sm font-semibold">Firebase Project Details</div>
+                    <div className="text-[11px] opacity-65">
+                      {authMode === 'signup'
+                        ? 'Required for new accounts — saved automatically for future logins'
+                        : 'One-time setup on this browser'}
+                    </div>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setShowSnippetBox((v) => !v)}
+                  className="inline-flex items-center gap-1 text-xs font-medium px-2.5 py-1 rounded-lg cursor-pointer shrink-0"
+                  style={{
+                    background: 'var(--accent-container)',
+                    color: 'var(--accent-container-text)',
+                  }}
+                >
+                  <ClipboardPaste className="w-3.5 h-3.5" />
+                  Paste Snippet
+                </button>
+              </div>
+
+              {showSnippetBox && (
+                <div className="space-y-2 pt-1">
+                  <textarea
+                    value={snippetText}
+                    onChange={(e) => setSnippetText(e.target.value)}
+                    rows={4}
+                    placeholder={'Paste Firebase config snippet:\nconst firebaseConfig = {\n  apiKey: "...",\n  projectId: "...",\n  appId: "..."\n};'}
+                    className="w-full rounded-xl px-3 py-2 text-xs font-mono border focus:outline-none"
+                    style={{
+                      background: 'var(--bg-surface)',
+                      borderColor: 'var(--border-subtle)',
+                    }}
+                  />
+                  <button
+                    type="button"
+                    onClick={handleParseSnippet}
+                    className="px-3 py-1.5 rounded-xl text-xs font-semibold cursor-pointer"
+                    style={{
+                      background: 'var(--accent)',
+                      color: 'var(--accent-on)',
+                    }}
+                  >
+                    Auto-fill Fields
+                  </button>
+                </div>
+              )}
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                <div>
+                  <label className="block text-[11px] font-medium opacity-70 mb-1">
+                    Project ID *
+                  </label>
+                  <input
+                    type="text"
+                    value={projectId}
+                    onChange={(e) => setProjectId(e.target.value)}
+                    placeholder="my-pinotes-project"
+                    className="w-full rounded-xl px-3 py-2 text-sm border focus:outline-none"
+                    style={{
+                      background: 'var(--bg-surface)',
+                      borderColor: 'var(--border-subtle)',
+                    }}
+                  />
+                </div>
+                <div>
+                  <label className="block text-[11px] font-medium opacity-70 mb-1">
+                    API Key *
+                  </label>
+                  <input
+                    type="text"
+                    value={apiKey}
+                    onChange={(e) => setApiKey(e.target.value)}
+                    placeholder="AIzaSy..."
+                    className="w-full rounded-xl px-3 py-2 text-sm border focus:outline-none"
+                    style={{
+                      background: 'var(--bg-surface)',
+                      borderColor: 'var(--border-subtle)',
+                    }}
+                  />
+                </div>
+                <div>
+                  <label className="block text-[11px] font-medium opacity-70 mb-1">
+                    App ID *
+                  </label>
+                  <input
+                    type="text"
+                    value={appId}
+                    onChange={(e) => setAppId(e.target.value)}
+                    placeholder="1:123456:web:abcdef"
+                    className="w-full rounded-xl px-3 py-2 text-sm border focus:outline-none"
+                    style={{
+                      background: 'var(--bg-surface)',
+                      borderColor: 'var(--border-subtle)',
+                    }}
+                  />
+                </div>
+                <div>
+                  <label className="block text-[11px] font-medium opacity-70 mb-1">
+                    Storage Bucket
+                  </label>
+                  <input
+                    type="text"
+                    value={storageBucket}
+                    onChange={(e) => setStorageBucket(e.target.value)}
+                    placeholder="project.firebasestorage.app"
+                    className="w-full rounded-xl px-3 py-2 text-sm border focus:outline-none"
+                    style={{
+                      background: 'var(--bg-surface)',
+                      borderColor: 'var(--border-subtle)',
+                    }}
+                  />
+                </div>
+              </div>
+            </div>
+          )}
+
           {/* Email & Password */}
           <div className="space-y-3">
             <div>
@@ -360,7 +397,7 @@ export const SetupAuthScreen: React.FC<SetupAuthScreenProps> = ({
                   type="email"
                   required
                   value={email}
-                  onChange={(e) => setEmail(e.target.value)}
+                  onChange={(e) => handleEmailChange(e.target.value)}
                   placeholder="you@example.com"
                   className="w-full rounded-xl pl-10 pr-3.5 py-2.5 text-sm border focus:outline-none"
                   style={{
@@ -425,14 +462,14 @@ export const SetupAuthScreen: React.FC<SetupAuthScreenProps> = ({
             ) : (
               <>
                 <KeyRound className="w-4 h-4" />
-                {authMode === 'signin' ? 'Connect & Sync Notes' : 'Register & Start Syncing'}
+                {authMode === 'signin' ? 'Sign In & Sync Notes' : 'Create Account & Sync'}
               </>
             )}
           </button>
 
           <p className="text-[11px] text-center opacity-60 leading-relaxed">
-            Your Firebase credentials stay strictly in your browser&apos;s local storage and
-            communicate directly with your private Firebase project.
+            Your Firebase configuration is saved automatically with your login credentials so
+            returning sign-ins only require your email and password.
           </p>
         </form>
       </div>

@@ -29,7 +29,10 @@ To sign in from your GitHub Pages website:
 1. Open the **Firebase Console** for the project you use with PINotes.
 2. Go to **Authentication** → **Settings** → **Authorized domains** → **Add domain**.
 3. Add `<your-github-username>.github.io`.
-4. Open your PINotes Web URL, enter your Firebase Project config (or paste the config snippet from Firebase Console), and sign in with the exact same Email & Password used on Android.
+4. First time setup: switch to **Create Account** (if new) or expand Firebase config on **Sign In**, enter your Firebase config once, and sign in. Your browser remembers your Firebase config per email so subsequent **Sign In** attempts only ask for Email & Password.
+5. **Signing in on another device (phone/tablet) without re-typing Firebase config:**
+   - **Option A (Quick-Login Link):** In PINotes Web **Settings** → click **Copy Quick-Login Link for Other Devices** and open it on your phone/laptop.
+   - **Option B (Optional GitHub Repo Variables):** In GitHub repo → **Settings → Secrets and variables → Actions → Variables**, add `VITE_FIREBASE_API_KEY`, `VITE_FIREBASE_PROJECT_ID`, `VITE_FIREBASE_APP_ID`, and `VITE_FIREBASE_STORAGE_BUCKET` so every fresh device defaults to your Firebase project automatically.
 
 ---
 

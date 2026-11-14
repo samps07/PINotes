@@ -13,8 +13,10 @@ import {
   uploadBytesResumable,
   getDownloadURL,
   deleteObject,
+  getStorage,
   FirebaseStorage,
 } from 'firebase/storage';
+import { FirebaseApp } from 'firebase/app';
 import {
   DEFAULT_CATEGORIES,
   DEFAULT_TAGS,
@@ -235,21 +237,29 @@ export async function permanentlyDeleteNote(
   await deleteDoc(doc(db, 'users', uid, 'notes', note.noteId));
 }
 
-export async function uploadImageForNote(
-  storage: FirebaseStorage,
-  uid: string,
-  noteId: string,
+async function uploadToBucketWithTimeout(
+  targetStorage: FirebaseStorage,
+  storagePath: string,
   file: File,
-  onProgress?: (pct: number) => void
-): Promise<{ downloadUrl: string; storagePath: string; attachment: SyncAttachment }> {
-  const safeName = file.name.replace(/[^a-zA-Z0-9._-]/g, '_');
-  const storagePath = `users/${uid}/notes/${noteId}/images/${Date.now()}_${safeName}`;
-  const storageRef = ref(storage, storagePath);
+  onProgress?: (pct: number) => void,
+  timeoutMs = 12000
+): Promise<string> {
+  const storageRef = ref(targetStorage, storagePath);
 
   await new Promise<void>((resolve, reject) => {
     const task = uploadBytesResumable(storageRef, file, {
       contentType: file.type || 'image/jpeg',
     });
+
+    const timer = setTimeout(() => {
+      try {
+        task.cancel();
+      } catch {
+        // ignore cancel error
+      }
+      reject(new Error('Firebase Storage upload timed out (CORS or unreachable bucket).'));
+    }, timeoutMs);
+
     task.on(
       'state_changed',
       (snap) => {
@@ -257,23 +267,159 @@ export async function uploadImageForNote(
           onProgress(Math.round((snap.bytesTransferred / snap.totalBytes) * 100));
         }
       },
-      (err) => reject(err),
-      () => resolve()
+      (err) => {
+        clearTimeout(timer);
+        reject(err);
+      },
+      () => {
+        clearTimeout(timer);
+        resolve();
+      }
     );
   });
 
-  const downloadUrl = await getDownloadURL(storageRef);
-  return {
-    downloadUrl,
-    storagePath,
-    attachment: {
-      fileName: file.name,
-      mimeType: file.type || 'image/jpeg',
-      fileSize: file.size,
-      storagePath,
+  return getDownloadURL(storageRef);
+}
+
+/**
+ * Compresses an image in the browser via Canvas to a compact JPEG data URL
+ * so image notes still succeed and sync via Firestore even if Firebase Storage
+ * CORS or Spark-plan Storage restrictions block direct bucket uploads.
+ */
+async function compressImageToDataUrl(file: File, maxDim = 1024, maxChars = 420000): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error('Failed to read image file.'));
+    reader.onload = () => {
+      const img = new Image();
+      img.onerror = () => reject(new Error('Invalid or unsupported image file.'));
+      img.onload = () => {
+        let width = img.naturalWidth || img.width;
+        let height = img.naturalHeight || img.height;
+
+        if (width > maxDim || height > maxDim) {
+          const ratio = Math.min(maxDim / width, maxDim / height);
+          width = Math.max(1, Math.round(width * ratio));
+          height = Math.max(1, Math.round(height * ratio));
+        }
+
+        const canvas = document.createElement('canvas');
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) {
+          reject(new Error('Canvas context unavailable.'));
+          return;
+        }
+        ctx.drawImage(img, 0, 0, width, height);
+
+        let quality = 0.78;
+        let dataUrl = canvas.toDataURL('image/jpeg', quality);
+        while (dataUrl.length > maxChars && quality > 0.35) {
+          quality -= 0.12;
+          dataUrl = canvas.toDataURL('image/jpeg', quality);
+        }
+
+        if (dataUrl.length > maxChars) {
+          // Further downscale if still large
+          const scale = 0.65;
+          canvas.width = Math.max(1, Math.round(width * scale));
+          canvas.height = Math.max(1, Math.round(height * scale));
+          ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+          dataUrl = canvas.toDataURL('image/jpeg', 0.6);
+        }
+
+        resolve(dataUrl);
+      };
+      img.src = reader.result as string;
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+export async function uploadImageForNote(
+  storage: FirebaseStorage,
+  uid: string,
+  noteId: string,
+  file: File,
+  onProgress?: (pct: number) => void,
+  firebaseApp?: FirebaseApp | null
+): Promise<{
+  downloadUrl: string;
+  storagePath: string;
+  attachment: SyncAttachment;
+  usedInlineFallback?: boolean;
+}> {
+  const safeName = file.name.replace(/[^a-zA-Z0-9._-]/g, '_');
+  const storagePath = `users/${uid}/notes/${noteId}/images/${Date.now()}_${safeName}`;
+
+  try {
+    const downloadUrl = await uploadToBucketWithTimeout(storage, storagePath, file, onProgress);
+    return {
       downloadUrl,
-    },
-  };
+      storagePath,
+      attachment: {
+        fileName: file.name,
+        mimeType: file.type || 'image/jpeg',
+        fileSize: file.size,
+        storagePath,
+        downloadUrl,
+      },
+    };
+  } catch (primaryErr) {
+    // Try alternate Firebase Storage bucket domain (.appspot.com <-> .firebasestorage.app) if app available
+    if (firebaseApp) {
+      const configuredBucket = firebaseApp.options.storageBucket || '';
+      const projectId = firebaseApp.options.projectId || '';
+      const altBucket = configuredBucket.endsWith('.firebasestorage.app')
+        ? `${projectId}.appspot.com`
+        : `${projectId}.firebasestorage.app`;
+
+      if (projectId && altBucket !== configuredBucket) {
+        try {
+          const altStorage = getStorage(firebaseApp, `gs://${altBucket}`);
+          const downloadUrl = await uploadToBucketWithTimeout(
+            altStorage,
+            storagePath,
+            file,
+            onProgress
+          );
+          return {
+            downloadUrl,
+            storagePath,
+            attachment: {
+              fileName: file.name,
+              mimeType: file.type || 'image/jpeg',
+              fileSize: file.size,
+              storagePath,
+              downloadUrl,
+            },
+          };
+        } catch {
+          // Proceed to inline compressed fallback
+        }
+      }
+    }
+
+    console.warn(
+      'Firebase Storage upload failed, falling back to compressed Firestore image:',
+      primaryErr
+    );
+
+    const dataUrl = await compressImageToDataUrl(file);
+    return {
+      downloadUrl: dataUrl,
+      storagePath: '',
+      usedInlineFallback: true,
+      attachment: {
+        fileName: file.name,
+        mimeType: 'image/jpeg',
+        fileSize: dataUrl.length,
+        storagePath: '',
+        downloadUrl: dataUrl,
+      },
+    };
+  }
 }
 
 export async function uploadFileForNote(
@@ -285,25 +431,7 @@ export async function uploadFileForNote(
 ): Promise<SyncAttachment> {
   const safeName = file.name.replace(/[^a-zA-Z0-9._-]/g, '_');
   const storagePath = `users/${uid}/attachments/${noteId}/${Date.now()}_${safeName}`;
-  const storageRef = ref(storage, storagePath);
-
-  await new Promise<void>((resolve, reject) => {
-    const task = uploadBytesResumable(storageRef, file, {
-      contentType: file.type || 'application/octet-stream',
-    });
-    task.on(
-      'state_changed',
-      (snap) => {
-        if (onProgress && snap.totalBytes > 0) {
-          onProgress(Math.round((snap.bytesTransferred / snap.totalBytes) * 100));
-        }
-      },
-      (err) => reject(err),
-      () => resolve()
-    );
-  });
-
-  const downloadUrl = await getDownloadURL(storageRef);
+  const downloadUrl = await uploadToBucketWithTimeout(storage, storagePath, file, onProgress, 20000);
   return {
     fileName: file.name,
     mimeType: file.type || 'application/octet-stream',
@@ -319,7 +447,12 @@ export function getNoteImageUrls(note: NoteDocument): string[] {
     note.imageUrl
       .split('|')
       .map((u) => u.trim())
-      .filter((u) => u.startsWith('http://') || u.startsWith('https://'))
+      .filter(
+        (u) =>
+          u.startsWith('http://') ||
+          u.startsWith('https://') ||
+          u.startsWith('data:image/')
+      )
       .forEach((u) => urls.add(u));
   }
   for (const att of note.attachments) {

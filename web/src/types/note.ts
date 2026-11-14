@@ -51,6 +51,12 @@ export interface FirebaseUserConfig {
   storageBucket: string;
 }
 
+export interface WebPasscodeConfig {
+  enabled: boolean;
+  passcodeHash: string | null;
+  updatedAt: number;
+}
+
 export type SyncStatus = 'SYNCED' | 'SYNCING' | 'OFFLINE' | 'ERROR';
 
 export type SidebarSection =

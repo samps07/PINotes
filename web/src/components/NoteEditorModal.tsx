@@ -41,6 +41,7 @@ interface NoteEditorModalProps {
     downloadUrl: string;
     storagePath: string;
     attachment: SyncAttachment;
+    usedInlineFallback?: boolean;
   }>;
   onUploadFile: (noteId: string, file: File) => Promise<SyncAttachment>;
   onDeleteStoragePath: (path: string) => Promise<void>;
@@ -94,6 +95,7 @@ export const NoteEditorModal: React.FC<NoteEditorModalProps> = ({
 
   const [isUploading, setIsUploading] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
+  const [isDraggingImage, setIsDraggingImage] = useState(false);
 
   const imageInputRef = useRef<HTMLInputElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -137,29 +139,67 @@ export const NoteEditorModal: React.FC<NoteEditorModalProps> = ({
     }
   };
 
-  const handleImageUpload = async (files: FileList | null) => {
-    if (!files || files.length === 0) return;
+  const handleImageFiles = async (fileList: File[]) => {
+    const validImages = fileList.filter((f) => f.type.startsWith('image/'));
+    if (validImages.length === 0) return;
     setIsUploading(true);
+    let anyFallback = false;
     try {
-      let nextAttachments = [...attachments];
+      const nextAttachments = [...attachments];
       const urls = imageUrl ? imageUrl.split('|').filter(Boolean) : [];
       const paths = imageStoragePath ? imageStoragePath.split('|').filter(Boolean) : [];
 
-      for (const file of Array.from(files)) {
+      for (const file of validImages) {
         const res = await onUploadImage(note.noteId, file);
+        if (res.usedInlineFallback) anyFallback = true;
         nextAttachments.push(res.attachment);
         if (!urls.includes(res.downloadUrl)) urls.push(res.downloadUrl);
-        if (!paths.includes(res.storagePath)) paths.push(res.storagePath);
+        if (res.storagePath && !paths.includes(res.storagePath)) paths.push(res.storagePath);
       }
 
       setAttachments(nextAttachments);
       setImageUrl(urls.length > 0 ? urls.join('|') : null);
       setImageStoragePath(paths.length > 0 ? paths.join('|') : null);
-      onNotify('Image uploaded and synced');
+      onNotify(
+        anyFallback
+          ? 'Image saved directly inside note (synced via Firestore)'
+          : 'Image uploaded and synced'
+      );
     } catch (err: unknown) {
       onNotify(err instanceof Error ? err.message : 'Image upload failed');
     } finally {
       setIsUploading(false);
+    }
+  };
+
+  const handleImageUpload = async (files: FileList | null) => {
+    if (!files || files.length === 0) return;
+    await handleImageFiles(Array.from(files));
+  };
+
+  const handlePaste = (e: React.ClipboardEvent) => {
+    const items = e.clipboardData?.items;
+    if (!items) return;
+    const pastedImages: File[] = [];
+    for (const item of Array.from(items)) {
+      if (item.type.startsWith('image/')) {
+        const f = item.getAsFile();
+        if (f) pastedImages.push(f);
+      }
+    }
+    if (pastedImages.length > 0) {
+      e.preventDefault();
+      void handleImageFiles(pastedImages);
+    }
+  };
+
+  const handleDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDraggingImage(false);
+    const dropped = Array.from(e.dataTransfer?.files || []);
+    const images = dropped.filter((f) => f.type.startsWith('image/'));
+    if (images.length > 0) {
+      void handleImageFiles(images);
     }
   };
 
@@ -228,7 +268,16 @@ export const NoteEditorModal: React.FC<NoteEditorModalProps> = ({
     >
       <div
         onClick={(e) => e.stopPropagation()}
-        className="w-full max-w-2xl max-h-[92vh] rounded-3xl border shadow-2xl flex flex-col overflow-hidden"
+        onPaste={handlePaste}
+        onDragOver={(e) => {
+          e.preventDefault();
+          setIsDraggingImage(true);
+        }}
+        onDragLeave={() => setIsDraggingImage(false)}
+        onDrop={handleDrop}
+        className={`w-full max-w-2xl max-h-[92vh] rounded-3xl border shadow-2xl flex flex-col overflow-hidden transition-all ${
+          isDraggingImage ? 'ring-2 ring-[#D0BCFF]' : ''
+        }`}
         style={{
           background: colors.bg,
           color: colors.text,

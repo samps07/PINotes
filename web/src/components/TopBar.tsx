@@ -12,6 +12,7 @@ import {
   CheckCircle2,
   WifiOff,
   AlertTriangle,
+  Lock,
 } from 'lucide-react';
 import { SyncStatus } from '../types/note';
 
@@ -27,6 +28,8 @@ interface TopBarProps {
   onToggleSidebar: () => void;
   onOpenSettings: () => void;
   userEmail: string | null;
+  showLockButton?: boolean;
+  onLockNow?: () => void;
 }
 
 export const TopBar: React.FC<TopBarProps> = ({
@@ -41,6 +44,8 @@ export const TopBar: React.FC<TopBarProps> = ({
   onToggleSidebar,
   onOpenSettings,
   userEmail,
+  showLockButton = false,
+  onLockNow,
 }) => {
   const statusChip = () => {
     switch (syncStatus) {
@@ -170,6 +175,18 @@ export const TopBar: React.FC<TopBarProps> = ({
           >
             {isDark ? <Sun className="w-5 h-5" /> : <Moon className="w-5 h-5" />}
           </button>
+
+          {showLockButton && onLockNow && (
+            <button
+              type="button"
+              onClick={onLockNow}
+              title="Lock PINotes Web"
+              className="p-2.5 rounded-full hover:bg-white/10 transition-colors cursor-pointer"
+              style={{ color: 'var(--accent)' }}
+            >
+              <Lock className="w-5 h-5" />
+            </button>
+          )}
 
           <button
             type="button"
