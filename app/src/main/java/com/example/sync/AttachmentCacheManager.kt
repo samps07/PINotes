@@ -21,12 +21,58 @@ data class SyncAttachment(
 object AttachmentCacheManager {
     private const val TAG = "AttachmentCache"
 
+    fun sanitizeFileName(rawName: String, fallbackExt: String = "bin"): String {
+        val last = rawName.substringAfterLast('/').substringBefore('?').trim()
+        val cleaned = last.replace(Regex("[^a-zA-Z0-9._-]"), "_")
+        return if (cleaned.isNotBlank() && cleaned != "." && cleaned != "..") {
+            cleaned
+        } else {
+            "att_${System.currentTimeMillis()}.$fallbackExt"
+        }
+    }
+
     fun getLocalCacheFile(context: Context, noteId: String, fileName: String): File {
-        val dir = File(context.cacheDir, "attachments/$noteId")
+        val safeNoteId = noteId.replace(Regex("[^a-zA-Z0-9._-]"), "_").ifBlank { "default" }
+        val dir = File(context.cacheDir, "attachments/$safeNoteId")
         if (!dir.exists()) {
             dir.mkdirs()
         }
-        return File(dir, fileName)
+        val safeFile = sanitizeFileName(fileName)
+        return File(dir, safeFile)
+    }
+
+    fun decodeAndCacheDataUri(
+        context: Context,
+        noteId: String,
+        fileName: String,
+        dataUri: String
+    ): File? {
+        if (!dataUri.startsWith("data:", ignoreCase = true)) return null
+        return try {
+            val commaIndex = dataUri.indexOf(',')
+            if (commaIndex == -1) return null
+            val header = dataUri.substring(5, commaIndex).lowercase()
+            val payload = dataUri.substring(commaIndex + 1)
+            val ext = when {
+                header.contains("image/png") -> "png"
+                header.contains("image/webp") -> "webp"
+                else -> "jpg"
+            }
+            val safeName = if (fileName.isNotBlank()) sanitizeFileName(fileName, ext) else "inline_${dataUri.hashCode().toUInt()}.$ext"
+            val localFile = getLocalCacheFile(context, noteId, safeName)
+            if (localFile.exists() && localFile.length() > 0) {
+                return localFile
+            }
+            val bytes = android.util.Base64.decode(payload, android.util.Base64.DEFAULT)
+            if (bytes.isEmpty()) return null
+            FileOutputStream(localFile).use { output ->
+                output.write(bytes)
+            }
+            localFile
+        } catch (e: Throwable) {
+            Log.e(TAG, "Failed to decode data URI for $noteId: ${e.message}", e)
+            null
+        }
     }
 
     suspend fun downloadAttachmentOnDemand(
@@ -35,6 +81,9 @@ object AttachmentCacheManager {
         fileName: String,
         downloadUrl: String
     ): File? = withContext(Dispatchers.IO) {
+        if (downloadUrl.startsWith("data:", ignoreCase = true)) {
+            return@withContext decodeAndCacheDataUri(context, noteId, fileName, downloadUrl)
+        }
         val localFile = getLocalCacheFile(context, noteId, fileName)
         if (localFile.exists() && localFile.length() > 0) {
             Log.d(TAG, "Attachment restoration: Cache hit for $fileName (noteId: $noteId)")

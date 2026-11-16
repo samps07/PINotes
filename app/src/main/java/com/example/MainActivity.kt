@@ -2447,23 +2447,29 @@ fun MainScreen(
                                     Spacer(modifier = Modifier.height(4.dp))
                                     Button(
                                         onClick = {
-                                            if (fbProjectId.isBlank() || fbAppId.isBlank() || fbApiKey.isBlank() || fbStorageBucket.isBlank()) {
-                                                Toast.makeText(context, "All configuration fields are required!", Toast.LENGTH_SHORT).show()
+                                            if (fbProjectId.isBlank() || fbAppId.isBlank() || fbApiKey.isBlank()) {
+                                                Toast.makeText(context, "Project ID, App ID, and Web API Key are required!", Toast.LENGTH_SHORT).show()
                                             } else {
-                                                val currentConf = FirebaseConfig.load(context)
-                                                val newConf = currentConf.copy(
-                                                    projectId = fbProjectId.trim(),
-                                                    appId = fbAppId.trim(),
-                                                    apiKey = fbApiKey.trim(),
-                                                    storageBucket = fbStorageBucket.trim(),
-                                                    isEnabled = true
-                                                )
-                                                FirebaseConfig.save(context, newConf)
-                                                val reinitApp = FirebaseConfig.initialize(context, newConf)
-                                                if (reinitApp != null) {
-                                                    Toast.makeText(context, "Configuration successfully saved and initialized!", Toast.LENGTH_LONG).show()
-                                                } else {
-                                                    Toast.makeText(context, "Saved. Ensure credentials are correct configuration.", Toast.LENGTH_LONG).show()
+                                                try {
+                                                    val currentConf = FirebaseConfig.load(context)
+                                                    val normalizedBucket = FirebaseConfig.normalizeStorageBucket(fbStorageBucket, fbProjectId)
+                                                    fbStorageBucket = normalizedBucket
+                                                    val newConf = currentConf.copy(
+                                                        projectId = fbProjectId.trim(),
+                                                        appId = fbAppId.trim(),
+                                                        apiKey = fbApiKey.trim(),
+                                                        storageBucket = normalizedBucket,
+                                                        isEnabled = true
+                                                    )
+                                                    FirebaseConfig.save(context, newConf)
+                                                    val reinitApp = FirebaseConfig.initialize(context, newConf)
+                                                    if (reinitApp != null) {
+                                                        Toast.makeText(context, "Configuration successfully saved and initialized!", Toast.LENGTH_LONG).show()
+                                                    } else {
+                                                        Toast.makeText(context, "Saved. Ensure credentials are correct configuration.", Toast.LENGTH_LONG).show()
+                                                    }
+                                                } catch (e: Throwable) {
+                                                    Toast.makeText(context, "Failed to save configuration: ${e.localizedMessage}", Toast.LENGTH_LONG).show()
                                                 }
                                             }
                                         },
@@ -2553,6 +2559,8 @@ fun MainScreen(
                                                         SyncManager.triggerSyncNow(context, viewModel.repository)
                                                         // Wait a short duration to let sync finish
                                                         kotlinx.coroutines.delay(500)
+                                                    } catch (t: Throwable) {
+                                                        Toast.makeText(context, "Sync failed: ${t.localizedMessage ?: "Unknown error"}", Toast.LENGTH_SHORT).show()
                                                     } finally {
                                                         isLoading = false
                                                     }
@@ -2635,7 +2643,21 @@ fun MainScreen(
                                                 Toast.makeText(context, "Please enter email and password credentials!", Toast.LENGTH_SHORT).show()
                                                 return@Button
                                             }
-                                            val confState = FirebaseConfig.load(context)
+                                            var confState = FirebaseConfig.load(context)
+                                            if (fbProjectId.isNotBlank() && fbAppId.isNotBlank() && fbApiKey.isNotBlank()) {
+                                                val normalizedBucket = FirebaseConfig.normalizeStorageBucket(fbStorageBucket, fbProjectId)
+                                                val candidateConf = confState.copy(
+                                                    projectId = fbProjectId.trim(),
+                                                    appId = fbAppId.trim(),
+                                                    apiKey = fbApiKey.trim(),
+                                                    storageBucket = normalizedBucket,
+                                                    isEnabled = true
+                                                )
+                                                if (candidateConf != confState) {
+                                                    FirebaseConfig.save(context, candidateConf)
+                                                    confState = FirebaseConfig.load(context)
+                                                }
+                                            }
                                             if (!confState.isValid()) {
                                                 Toast.makeText(context, "Invalid Firebase Configuration! Save project credentials first.", Toast.LENGTH_LONG).show()
                                                 return@Button
@@ -2643,14 +2665,27 @@ fun MainScreen(
                                             isLoading = true
                                             scope.launch {
                                                 try {
-                                                    val successState = SyncManager.loginOrRegisterUser(context, authEmail.trim(), authPassword.trim())
+                                                    val successState = SyncManager.loginOrRegisterUser(
+                                                        context = context,
+                                                        email = authEmail.trim(),
+                                                        password = authPassword,
+                                                        preferCreateAccount = isSignUpTab
+                                                    )
                                                     if (successState) {
                                                         // Immediately trigger first sync
                                                         SyncManager.initializeSync(context, viewModel.repository)
                                                         Toast.makeText(context, "Authenticated successfully: Online sync is active!", Toast.LENGTH_LONG).show()
                                                     } else {
-                                                        Toast.makeText(context, "Authentication failed. Check your credentials or Firebase configuration settings.", Toast.LENGTH_LONG).show()
+                                                        val errMsg = SyncManager.lastAuthError.value
+                                                            ?: "Authentication failed. Check your credentials or Firebase configuration settings."
+                                                        Toast.makeText(context, errMsg, Toast.LENGTH_LONG).show()
                                                     }
+                                                } catch (t: Throwable) {
+                                                    Toast.makeText(
+                                                        context,
+                                                        "Authentication error: ${t.localizedMessage ?: "Unexpected error"}",
+                                                        Toast.LENGTH_LONG
+                                                    ).show()
                                                 } finally {
                                                     isLoading = false
                                                 }

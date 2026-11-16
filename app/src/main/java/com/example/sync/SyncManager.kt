@@ -12,10 +12,13 @@ import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.firestore.FirebaseFirestore
 import com.google.firebase.firestore.ListenerRegistration
 import com.google.firebase.storage.FirebaseStorage
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.InputStream
 import java.util.UUID
 import kotlin.coroutines.resume
@@ -42,9 +45,14 @@ object SyncManager {
     val syncStatus = MutableStateFlow(SyncStatus.OFFLINE)
     val isUserLoggedIn = MutableStateFlow(false)
     val loggedInUserEmail = MutableStateFlow<String?>(null)
-    
+    val lastAuthError = MutableStateFlow<String?>(null)
+
     private var activeListener: ListenerRegistration? = null
-    private val scope = CoroutineScope(Dispatchers.IO)
+    private val exceptionHandler = CoroutineExceptionHandler { _, throwable ->
+        Log.e("SyncManager", "Uncaught coroutine exception in SyncManager: ${throwable.message}", throwable)
+        syncStatus.value = SyncStatus.ERROR
+    }
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO + exceptionHandler)
 
     fun isNetworkAvailable(context: Context): Boolean {
         val connectivityManager = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return false
@@ -59,41 +67,94 @@ object SyncManager {
     }
 
     // Dynamic Firebase Auth login
-    suspend fun loginOrRegisterUser(context: Context, email: String, password: String): Boolean {
-        val config = FirebaseConfig.load(context)
-        val app = FirebaseConfig.initialize(context, config) ?: return false
-        val auth = FirebaseAuth.getInstance(app)
-        
+    suspend fun loginOrRegisterUser(
+        context: Context,
+        email: String,
+        password: String,
+        preferCreateAccount: Boolean = false
+    ): Boolean = withContext(Dispatchers.IO) {
+        val cleanEmail = email.trim()
+        val cleanPassword = password
+        lastAuthError.value = null
+
+        val loadedConfig = FirebaseConfig.load(context)
+        if (!loadedConfig.isValid()) {
+            lastAuthError.value = "Invalid Firebase configuration. Please verify Project ID, App ID, and API Key."
+            syncStatus.value = SyncStatus.ERROR
+            return@withContext false
+        }
+
+        val activeConfig = loadedConfig.copy(isEnabled = true)
+        val app = try {
+            FirebaseConfig.initialize(context, activeConfig)
+        } catch (t: Throwable) {
+            Log.e("SyncManager", "Firebase initialize error during login: ${t.message}", t)
+            lastAuthError.value = t.localizedMessage ?: "Failed to initialize Firebase client."
+            syncStatus.value = SyncStatus.ERROR
+            return@withContext false
+        }
+
+        if (app == null) {
+            lastAuthError.value = "Failed to initialize Firebase app. Check Project ID, App ID, and Web API Key."
+            syncStatus.value = SyncStatus.ERROR
+            return@withContext false
+        }
+
+        val auth = try {
+            FirebaseAuth.getInstance(app)
+        } catch (t: Throwable) {
+            Log.e("SyncManager", "FirebaseAuth.getInstance failed: ${t.message}", t)
+            lastAuthError.value = t.localizedMessage ?: "Failed to initialize Firebase Authentication."
+            syncStatus.value = SyncStatus.ERROR
+            return@withContext false
+        }
+
         try {
             syncStatus.value = SyncStatus.SYNCING
-            // Try to log in
-            val authResult = auth.signInWithEmailAndPassword(email, password).await()
-            if (authResult.user != null) {
-                // Login successful
-                isUserLoggedIn.value = true
-                loggedInUserEmail.value = email
-                // Save config with email/password
-                FirebaseConfig.save(context, config.copy(isEnabled = true, userEmail = email, userPassword = password))
-                syncStatus.value = SyncStatus.SYNCED
-                return true
-            }
-        } catch (e: Exception) {
-            // Try to register if login failed
-            try {
-                val authResult = auth.createUserWithEmailAndPassword(email, password).await()
-                if (authResult.user != null) {
-                    isUserLoggedIn.value = true
-                    loggedInUserEmail.value = email
-                    FirebaseConfig.save(context, config.copy(isEnabled = true, userEmail = email, userPassword = password))
-                    syncStatus.value = SyncStatus.SYNCED
-                    return true
+            val authResult = if (preferCreateAccount) {
+                try {
+                    auth.createUserWithEmailAndPassword(cleanEmail, cleanPassword).await()
+                } catch (createEx: Exception) {
+                    if (createEx is com.google.firebase.auth.FirebaseAuthUserCollisionException) {
+                        auth.signInWithEmailAndPassword(cleanEmail, cleanPassword).await()
+                    } else {
+                        throw createEx
+                    }
                 }
-            } catch (ex: Exception) {
-                ex.printStackTrace()
+            } else {
+                try {
+                    auth.signInWithEmailAndPassword(cleanEmail, cleanPassword).await()
+                } catch (signInEx: Exception) {
+                    if (signInEx is com.google.firebase.auth.FirebaseAuthInvalidUserException) {
+                        auth.createUserWithEmailAndPassword(cleanEmail, cleanPassword).await()
+                    } else {
+                        throw signInEx
+                    }
+                }
             }
+
+            if (authResult.user != null) {
+                FirebaseConfig.save(
+                    context,
+                    activeConfig.copy(
+                        isEnabled = true,
+                        userEmail = cleanEmail,
+                        userPassword = cleanPassword
+                    )
+                )
+                isUserLoggedIn.value = true
+                loggedInUserEmail.value = authResult.user?.email ?: cleanEmail
+                syncStatus.value = SyncStatus.SYNCED
+                lastAuthError.value = null
+                return@withContext true
+            }
+            lastAuthError.value = "Authentication returned no user."
+        } catch (t: Throwable) {
+            Log.e("SyncManager", "Login/register failed: ${t.message}", t)
+            lastAuthError.value = t.localizedMessage ?: "Authentication failed. Check your credentials and Firebase settings."
         }
         syncStatus.value = SyncStatus.ERROR
-        return false
+        false
     }
 
     fun logout(context: Context) {
@@ -101,16 +162,20 @@ object SyncManager {
         if (app != null) {
             try {
                 FirebaseAuth.getInstance(app).signOut()
-            } catch (e: Exception) {
+            } catch (e: Throwable) {
                 e.printStackTrace()
             }
         }
-        activeListener?.remove()
+        try {
+            activeListener?.remove()
+        } catch (_: Throwable) {
+        }
         activeListener = null
-        
+
         isUserLoggedIn.value = false
         loggedInUserEmail.value = null
-        
+        lastAuthError.value = null
+
         val config = FirebaseConfig.load(context)
         FirebaseConfig.save(context, config.copy(isEnabled = false, userEmail = "", userPassword = ""))
         syncStatus.value = SyncStatus.OFFLINE
@@ -118,35 +183,35 @@ object SyncManager {
 
     fun initializeSync(context: Context, noteRepository: NoteRepository) {
         scope.launch {
-            val config = FirebaseConfig.load(context)
-            if (config.isValid() && config.isEnabled) {
-                val app = FirebaseConfig.initialize(context, config)
-                if (app != null) {
-                    val auth = FirebaseAuth.getInstance(app)
-                    val currentUser = auth.currentUser
-                    if (currentUser != null) {
-                        isUserLoggedIn.value = true
-                        loggedInUserEmail.value = currentUser.email
-                        // Auto sync on startup if firebase account is setup
-                        triggerSyncNow(context, noteRepository)
-                    } else if (config.userEmail.isNotBlank() && config.userPassword.isNotBlank()) {
-                        // Re-authenticate
-                        try {
+            try {
+                val config = FirebaseConfig.load(context)
+                if (config.isValid() && config.isEnabled) {
+                    val app = FirebaseConfig.initialize(context, config)
+                    if (app != null) {
+                        val auth = FirebaseAuth.getInstance(app)
+                        val currentUser = auth.currentUser
+                        if (currentUser != null) {
+                            isUserLoggedIn.value = true
+                            loggedInUserEmail.value = currentUser.email ?: config.userEmail
+                            // Auto sync on startup if firebase account is setup
+                            triggerSyncNow(context, noteRepository)
+                        } else if (config.userEmail.isNotBlank() && config.userPassword.isNotBlank()) {
+                            // Re-authenticate
                             val authResult = auth.signInWithEmailAndPassword(config.userEmail, config.userPassword).await()
                             if (authResult.user != null) {
                                 isUserLoggedIn.value = true
-                                loggedInUserEmail.value = config.userEmail
+                                loggedInUserEmail.value = authResult.user?.email ?: config.userEmail
                                 // Auto sync on startup if firebase account is setup
                                 triggerSyncNow(context, noteRepository)
                             }
-                        } catch (e: Exception) {
-                            e.printStackTrace()
-                            syncStatus.value = SyncStatus.ERROR
                         }
                     }
+                } else {
+                    syncStatus.value = SyncStatus.OFFLINE
                 }
-            } else {
-                syncStatus.value = SyncStatus.OFFLINE
+            } catch (t: Throwable) {
+                Log.e("SyncManager", "initializeSync failed safely: ${t.message}", t)
+                syncStatus.value = SyncStatus.ERROR
             }
         }
     }
@@ -154,38 +219,36 @@ object SyncManager {
     // Force run sync right now
     fun triggerSyncNow(context: Context, noteRepository: NoteRepository) {
         scope.launch {
-            val config = FirebaseConfig.load(context)
-            if (!config.isValid() || !config.isEnabled) {
-                syncStatus.value = SyncStatus.OFFLINE
-                return@launch
-            }
-            if (!isNetworkAvailable(context)) {
-                syncStatus.value = SyncStatus.OFFLINE
-                return@launch
-            }
-            val app = FirebaseConfig.getApp() ?: FirebaseConfig.initialize(context, config)
-            if (app == null) {
-                syncStatus.value = SyncStatus.ERROR
-                return@launch
-            }
-            val auth = FirebaseAuth.getInstance(app)
-            val uid = auth.uid
-            if (uid != null) {
-                triggerSyncNow(context, app, uid, noteRepository)
-            } else {
-                // If not signed in but config exists
-                if (config.userEmail.isNotBlank() && config.userPassword.isNotBlank()) {
-                    try {
-                        val authResult = auth.signInWithEmailAndPassword(config.userEmail, config.userPassword).await()
-                        authResult.user?.let {
-                            isUserLoggedIn.value = true
-                            loggedInUserEmail.value = config.userEmail
-                            triggerSyncNow(context, app, it.uid, noteRepository)
-                        }
-                    } catch (e: Exception) {
-                        syncStatus.value = SyncStatus.ERROR
+            try {
+                val config = FirebaseConfig.load(context)
+                if (!config.isValid() || !config.isEnabled) {
+                    syncStatus.value = SyncStatus.OFFLINE
+                    return@launch
+                }
+                if (!isNetworkAvailable(context)) {
+                    syncStatus.value = SyncStatus.OFFLINE
+                    return@launch
+                }
+                val app = FirebaseConfig.getApp() ?: FirebaseConfig.initialize(context, config)
+                if (app == null) {
+                    syncStatus.value = SyncStatus.ERROR
+                    return@launch
+                }
+                val auth = FirebaseAuth.getInstance(app)
+                val uid = auth.uid
+                if (uid != null) {
+                    triggerSyncNow(context, app, uid, noteRepository)
+                } else if (config.userEmail.isNotBlank() && config.userPassword.isNotBlank()) {
+                    val authResult = auth.signInWithEmailAndPassword(config.userEmail, config.userPassword).await()
+                    authResult.user?.let {
+                        isUserLoggedIn.value = true
+                        loggedInUserEmail.value = it.email ?: config.userEmail
+                        triggerSyncNow(context, app, it.uid, noteRepository)
                     }
                 }
+            } catch (t: Throwable) {
+                Log.e("SyncManager", "triggerSyncNow failed safely: ${t.message}", t)
+                syncStatus.value = SyncStatus.ERROR
             }
         }
     }
@@ -320,12 +383,11 @@ object SyncManager {
         }
         
         val app = FirebaseConfig.getApp() ?: return null
-        val auth = FirebaseAuth.getInstance(app)
-        val uid = auth.currentUser?.uid ?: return null
-        val storage = FirebaseStorage.getInstance(app)
-        val firestore = FirebaseFirestore.getInstance(app)
-        
         return try {
+            val auth = FirebaseAuth.getInstance(app)
+            val uid = auth.currentUser?.uid ?: return null
+            val storage = FirebaseStorage.getInstance(app)
+            val firestore = FirebaseFirestore.getInstance(app)
             val uri = when {
                 localUriStr.startsWith("content://") || localUriStr.startsWith("file://") -> Uri.parse(localUriStr)
                 else -> Uri.fromFile(java.io.File(localUriStr))
@@ -432,10 +494,14 @@ object SyncManager {
      * Bidirectional dynamic Sync core method
      */
     private suspend fun performFullSync(context: Context, app: FirebaseApp, userId: String, noteRepository: NoteRepository): Boolean {
-        val firestore = FirebaseFirestore.getInstance(app)
-        val storage = FirebaseStorage.getInstance(app)
-        
         return try {
+            val firestore = FirebaseFirestore.getInstance(app)
+            val storage: FirebaseStorage? = try {
+                FirebaseStorage.getInstance(app)
+            } catch (storageEx: Throwable) {
+                Log.w("SyncManager", "FirebaseStorage unavailable (${storageEx.message}); continuing Firestore sync without Storage")
+                null
+            }
             val localNotes = noteRepository.getAllNotesDirect()
             val remoteNotesSnapshot = firestore.collection("users").document(userId).collection("notes")
                 .get().await()
@@ -457,15 +523,15 @@ object SyncManager {
                 
                 val finalImageUris = mutableListOf<String>()
                 for (imgUri in imageUrisToSync) {
-                    if (imgUri.startsWith("http://") || imgUri.startsWith("https://")) {
-                        // Keep remote
+                    if (imgUri.startsWith("http://") || imgUri.startsWith("https://") || imgUri.startsWith("data:", ignoreCase = true)) {
+                        // Keep remote or inline data URI
                         finalImageUris.add(imgUri)
                         val existing = currentLocalAttachments.find { it.downloadUrl == imgUri }
                         if (existing != null) {
                             newAttachments.add(existing)
-                        } else {
+                        } else if (!imgUri.startsWith("data:", ignoreCase = true)) {
                             // Rehydrate metadata dynamically for safe migration
-                            val fallbackName = Uri.parse(imgUri).lastPathSegment ?: "image.jpg"
+                            val fallbackName = AttachmentCacheManager.sanitizeFileName(Uri.parse(imgUri).lastPathSegment ?: "image.jpg", "jpg")
                             newAttachments.add(
                                 SyncAttachment(
                                     fileName = fallbackName,
@@ -478,13 +544,15 @@ object SyncManager {
                         }
                     } else {
                         // Check if this local file was previously synced or cached from remote
+                        val fileNameHint = imgUri.substringAfterLast('/')
                         val existing = currentLocalAttachments.find {
-                            it.downloadUrl == imgUri || imgUri.contains(it.fileName) || (it.storagePath.isNotEmpty() && imgUri.endsWith(it.fileName))
+                            it.downloadUrl == imgUri ||
+                                (it.fileName.isNotBlank() && (imgUri.endsWith(it.fileName) || fileNameHint == AttachmentCacheManager.sanitizeFileName(it.fileName)))
                         }
                         if (existing != null && existing.downloadUrl.isNotBlank()) {
                             finalImageUris.add(existing.downloadUrl)
                             newAttachments.add(existing)
-                        } else {
+                        } else if (storage != null) {
                             // Needs upload to Firebase Storage
                             val att = uploadAndCreateAttachment(context, localNote.noteId, imgUri, storage, userId)
                             if (att != null) {
@@ -494,6 +562,8 @@ object SyncManager {
                             } else {
                                 finalImageUris.add(imgUri)
                             }
+                        } else {
+                            finalImageUris.add(imgUri)
                         }
                     }
                 }
@@ -505,9 +575,9 @@ object SyncManager {
                 
                 val finalAttachmentUris = mutableListOf<String>()
                 for (attUri in attachmentsToSync) {
-                    if (!attUri.startsWith("http://") && !attUri.startsWith("https://")) {
-                        // Needs upload
-                        val att = uploadAndCreateAttachment(context, localNote.noteId, attUri, storage, userId)
+                    if (!attUri.startsWith("http://") && !attUri.startsWith("https://") && !attUri.startsWith("data:", ignoreCase = true)) {
+                        // Needs upload if storage is available
+                        val att = if (storage != null) uploadAndCreateAttachment(context, localNote.noteId, attUri, storage, userId) else null
                         if (att != null) {
                             newAttachments.add(att)
                             finalAttachmentUris.add(att.downloadUrl)
@@ -521,8 +591,8 @@ object SyncManager {
                         val existing = currentLocalAttachments.find { it.downloadUrl == attUri }
                         if (existing != null) {
                             newAttachments.add(existing)
-                        } else {
-                            val fallbackName = Uri.parse(attUri).lastPathSegment ?: "document.bin"
+                        } else if (!attUri.startsWith("data:", ignoreCase = true)) {
+                            val fallbackName = AttachmentCacheManager.sanitizeFileName(Uri.parse(attUri).lastPathSegment ?: "document.bin")
                             newAttachments.add(
                                 SyncAttachment(
                                     fileName = fallbackName,
@@ -573,7 +643,7 @@ object SyncManager {
                 )
                 
                 // Handle Storage deletion if local note is soft-deleted
-                if (updatedLocalNote.deletedAt != null) {
+                if (updatedLocalNote.deletedAt != null && storage != null) {
                     val attachmentsToDelete = AttachmentCacheManager.deserializeAttachments(updatedLocalNote.attachmentsJson)
                     for (att in attachmentsToDelete) {
                         if (att.storagePath.isNotEmpty()) {
@@ -686,10 +756,14 @@ object SyncManager {
                                 val downloaded = finalRemoteNote.copy(id = localNote.id)
                                 noteRepository.updateFromSync(downloaded)
                                 preCacheNoteImages(context, downloaded)
-                                if (downloaded.isScheduled && downloaded.scheduledTime != null) {
-                                    com.example.NotificationScheduler.schedule(context, downloaded)
-                                } else {
-                                    com.example.NotificationScheduler.cancel(context, downloaded.id)
+                                try {
+                                    if (downloaded.isScheduled && downloaded.scheduledTime != null) {
+                                        com.example.NotificationScheduler.schedule(context, downloaded)
+                                    } else {
+                                        com.example.NotificationScheduler.cancel(context, downloaded.id)
+                                    }
+                                } catch (e: Throwable) {
+                                    Log.w("SyncManager", "Schedule update warning: ${e.message}")
                                 }
                             }
                         }
@@ -707,8 +781,12 @@ object SyncManager {
                         val newId = noteRepository.insertFromSync(remoteNote)
                         val insertedNote = remoteNote.copy(id = newId.toInt())
                         preCacheNoteImages(context, insertedNote)
-                        if (insertedNote.isScheduled && insertedNote.scheduledTime != null) {
-                            com.example.NotificationScheduler.schedule(context, insertedNote)
+                        try {
+                            if (insertedNote.isScheduled && insertedNote.scheduledTime != null) {
+                                com.example.NotificationScheduler.schedule(context, insertedNote)
+                            }
+                        } catch (e: Throwable) {
+                            Log.w("SyncManager", "Schedule insert warning: ${e.message}")
                         }
                     }
                 }
@@ -768,8 +846,8 @@ object SyncManager {
             }
 
             true
-        } catch (e: Exception) {
-            e.printStackTrace()
+        } catch (e: Throwable) {
+            Log.e("SyncManager", "performFullSync failed safely: ${e.message}", e)
             false
         }
     }
@@ -781,29 +859,37 @@ object SyncManager {
         val atts = AttachmentCacheManager.deserializeAttachments(note.attachmentsJson)
         for (att in atts) {
             if (att.mimeType.startsWith("image/") && att.downloadUrl.isNotBlank()) {
-                val cached = AttachmentCacheManager.getLocalCacheFile(context, note.noteId, att.fileName)
-                if (!cached.exists() || cached.length() == 0L) {
-                    scope.launch {
-                        try {
-                            AttachmentCacheManager.downloadAttachmentOnDemand(context, note.noteId, att.fileName, att.downloadUrl)
-                        } catch (e: Exception) {
-                            Log.w("SyncManager", "Pre-cache failed for ${att.fileName}: ${e.message}")
+                if (att.downloadUrl.startsWith("data:", ignoreCase = true)) {
+                    AttachmentCacheManager.decodeAndCacheDataUri(context, note.noteId, att.fileName, att.downloadUrl)
+                } else if (att.downloadUrl.startsWith("http://") || att.downloadUrl.startsWith("https://")) {
+                    val cached = AttachmentCacheManager.getLocalCacheFile(context, note.noteId, att.fileName)
+                    if (!cached.exists() || cached.length() == 0L) {
+                        scope.launch {
+                            try {
+                                AttachmentCacheManager.downloadAttachmentOnDemand(context, note.noteId, att.fileName, att.downloadUrl)
+                            } catch (e: Exception) {
+                                Log.w("SyncManager", "Pre-cache failed for ${att.fileName}: ${e.message}")
+                            }
                         }
                     }
                 }
             }
         }
         if (!note.imageUrl.isNullOrEmpty()) {
-            val urls = note.imageUrl.split("|").filter { it.startsWith("http://") || it.startsWith("https://") }
-            for (url in urls) {
-                val fileName = Uri.parse(url).lastPathSegment ?: "img_${System.currentTimeMillis()}.jpg"
-                val cached = AttachmentCacheManager.getLocalCacheFile(context, note.noteId, fileName)
-                if (!cached.exists() || cached.length() == 0L) {
-                    scope.launch {
-                        try {
-                            AttachmentCacheManager.downloadAttachmentOnDemand(context, note.noteId, fileName, url)
-                        } catch (e: Exception) {
-                            // Ignore
+            val urls = note.imageUrl.split("|").filter { it.isNotBlank() }
+            urls.forEachIndexed { idx, url ->
+                if (url.startsWith("data:", ignoreCase = true)) {
+                    AttachmentCacheManager.decodeAndCacheDataUri(context, note.noteId, "img_$idx.jpg", url)
+                } else if (url.startsWith("http://") || url.startsWith("https://")) {
+                    val fileName = AttachmentCacheManager.sanitizeFileName(Uri.parse(url).lastPathSegment ?: "img_$idx.jpg", "jpg")
+                    val cached = AttachmentCacheManager.getLocalCacheFile(context, note.noteId, fileName)
+                    if (!cached.exists() || cached.length() == 0L) {
+                        scope.launch {
+                            try {
+                                AttachmentCacheManager.downloadAttachmentOnDemand(context, note.noteId, fileName, url)
+                            } catch (e: Exception) {
+                                // Ignore
+                            }
                         }
                     }
                 }
@@ -879,71 +965,104 @@ fun Map<String, Any?>.toNote(context: Context, localId: Int = 0): Note {
         }
     }
     
+    val resolvedNoteId = (this["noteId"] as? String)?.takeIf { it.isNotBlank() } ?: UUID.randomUUID().toString()
     val attachments = AttachmentCacheManager.mapListToList(rawList)
-    val attachmentsJsonStr = if (attachments.isNotEmpty()) AttachmentCacheManager.serializeAttachments(attachments) else null
-    
-    // Detailed Logging: Attachment restoration
-    if (attachments.isNotEmpty()) {
-        Log.d("SyncManager", "Attachment restoration: Restored ${attachments.size} attachments from Firestore for noteId = ${this["noteId"]}")
+
+    // Decode any inline data:image/... URLs into local cache files so Coil renders cleanly and Room row stays small
+    val cachedAttachments = attachments.mapIndexed { idx, att ->
+        if (att.mimeType.startsWith("image/") && att.downloadUrl.startsWith("data:", ignoreCase = true)) {
+            val file = AttachmentCacheManager.decodeAndCacheDataUri(context, resolvedNoteId, att.fileName.ifBlank { "inline_$idx.jpg" }, att.downloadUrl)
+            if (file != null) {
+                att.copy(downloadUrl = Uri.fromFile(file).toString())
+            } else att
+        } else att
     }
 
-    val imageUrlSec = this["imageUrl"] as? String ?: this["imageUri"] as? String
+    val rawImageUrlSec = (this["imageUrl"] as? String) ?: (this["imageUri"] as? String)
     val imageStoragePathSec = this["imageStoragePath"] as? String
 
-    // Detailed Logging: Image restoration on another device
-    if (!imageUrlSec.isNullOrEmpty()) {
-        Log.d("SyncManager", "Image restoration on another device: Restored imageUrl = $imageUrlSec, storagePath = $imageStoragePathSec for noteId = ${this["noteId"]}")
+    // Reconstruct compact local imageUri and safe imageUrl without exceeding SQLite CursorWindow limits
+    val imageAttachments = cachedAttachments.filter { it.mimeType.startsWith("image/") }
+    val nonImageAttachments = cachedAttachments.filter { !it.mimeType.startsWith("image/") }
+
+    val decodedRawUrls = if (!rawImageUrlSec.isNullOrEmpty()) {
+        rawImageUrlSec.split("|").map { it.trim() }.filter { it.isNotEmpty() }.mapIndexed { idx, url ->
+            if (url.startsWith("data:", ignoreCase = true)) {
+                val file = AttachmentCacheManager.decodeAndCacheDataUri(context, resolvedNoteId, "inline_$idx.jpg", url)
+                if (file != null) Uri.fromFile(file).toString() else url
+            } else {
+                url
+            }
+        }
+    } else emptyList()
+
+    // Guard Room CursorWindow (< ~750KB total inline payloads)
+    val originalInlineBytes = (rawImageUrlSec?.length ?: 0) + attachments.sumOf { it.downloadUrl.length }
+    val safeAttachmentsForStorage = if (originalInlineBytes > 750_000) cachedAttachments else attachments
+    val attachmentsJsonStr = if (safeAttachmentsForStorage.isNotEmpty()) AttachmentCacheManager.serializeAttachments(safeAttachmentsForStorage) else null
+    val safeImageUrlSec = if (originalInlineBytes > 750_000) decodedRawUrls.joinToString("|").ifBlank { null } else rawImageUrlSec
+
+    // Detailed Logging: Attachment restoration
+    if (attachments.isNotEmpty()) {
+        Log.d("SyncManager", "Attachment restoration: Restored ${attachments.size} attachments from Firestore for noteId = $resolvedNoteId")
     }
 
-    // Reconstruct local imageUri and attachmentUri pointing to cache
-    val imageAttachments = attachments.filter { it.mimeType.startsWith("image/") }
-    val nonImageAttachments = attachments.filter { !it.mimeType.startsWith("image/") }
-    
+    // Detailed Logging: Image restoration on another device
+    if (!safeImageUrlSec.isNullOrEmpty()) {
+        Log.d("SyncManager", "Image restoration on another device: Restored imageUrl (len=${safeImageUrlSec.length}), storagePath = $imageStoragePathSec for noteId = $resolvedNoteId")
+    }
+
     val imageUriSec = if (imageAttachments.isNotEmpty()) {
         imageAttachments.map { att ->
-            val cachedFile = AttachmentCacheManager.getLocalCacheFile(context, (this["noteId"] as? String) ?: "", att.fileName)
-            if (cachedFile.exists() && cachedFile.length() > 0) {
-                Uri.fromFile(cachedFile).toString()
-            } else if (att.downloadUrl.isNotBlank()) {
+            if (att.downloadUrl.startsWith("file://")) {
                 att.downloadUrl
             } else {
-                Uri.fromFile(cachedFile).toString()
+                val cachedFile = AttachmentCacheManager.getLocalCacheFile(context, resolvedNoteId, att.fileName)
+                if (cachedFile.exists() && cachedFile.length() > 0) {
+                    Uri.fromFile(cachedFile).toString()
+                } else if (att.downloadUrl.isNotBlank()) {
+                    att.downloadUrl
+                } else {
+                    Uri.fromFile(cachedFile).toString()
+                }
             }
         }.joinToString("|")
-    } else imageUrlSec
-    
+    } else if (decodedRawUrls.isNotEmpty()) {
+        decodedRawUrls.joinToString("|")
+    } else safeImageUrlSec
+
     val attachmentUriSec = if (nonImageAttachments.isNotEmpty()) {
         val att = nonImageAttachments.first()
-        val cachedFile = AttachmentCacheManager.getLocalCacheFile(context, (this["noteId"] as? String) ?: "", att.fileName)
+        val cachedFile = AttachmentCacheManager.getLocalCacheFile(context, resolvedNoteId, att.fileName)
         Uri.fromFile(cachedFile).toString()
     } else null
 
     return Note(
         id = localId,
-        noteId = (this["noteId"] as? String) ?: UUID.randomUUID().toString(),
+        noteId = resolvedNoteId,
         title = (this["title"] as? String) ?: "",
         content = (this["content"] as? String) ?: "",
-        timestamp = (this["timestamp"] as? Long) ?: System.currentTimeMillis(),
+        timestamp = (this["timestamp"] as? Number)?.toLong() ?: System.currentTimeMillis(),
         category = (this["category"] as? String) ?: "General",
-        colorIndex = (this["colorIndex"] as? Long)?.toInt() ?: 0,
+        colorIndex = (this["colorIndex"] as? Number)?.toInt() ?: 0,
         isPinned = (this["isPinned"] as? Boolean) ?: false,
         imageUri = imageUriSec,
         isTaskList = (this["isTaskList"] as? Boolean) ?: false,
         webUrl = (this["webUrl"] as? String),
         isScheduled = (this["isScheduled"] as? Boolean) ?: false,
-        scheduledTime = (this["scheduledTime"] as? Long),
+        scheduledTime = (this["scheduledTime"] as? Number)?.toLong(),
         repeatFrequency = (this["repeatFrequency"] as? String),
-        repeatIntervalMinutes = (this["repeatIntervalMinutes"] as? Long)?.toInt(),
-        repeatUntilTime = (this["repeatUntilTime"] as? Long),
-        position = (this["position"] as? Long)?.toInt() ?: 0,
+        repeatIntervalMinutes = (this["repeatIntervalMinutes"] as? Number)?.toInt(),
+        repeatUntilTime = (this["repeatUntilTime"] as? Number)?.toLong(),
+        position = (this["position"] as? Number)?.toInt() ?: 0,
         tags = (this["tags"] as? String),
         autoTags = (this["autoTags"] as? String),
         attachmentUri = attachmentUriSec,
-        createdAt = (this["createdAt"] as? Long) ?: System.currentTimeMillis(),
-        updatedAt = (this["updatedAt"] as? Long) ?: System.currentTimeMillis(),
-        deletedAt = (this["deletedAt"] as? Long),
+        createdAt = (this["createdAt"] as? Number)?.toLong() ?: System.currentTimeMillis(),
+        updatedAt = (this["updatedAt"] as? Number)?.toLong() ?: System.currentTimeMillis(),
+        deletedAt = (this["deletedAt"] as? Number)?.toLong(),
         attachmentsJson = attachmentsJsonStr,
-        imageUrl = imageUrlSec,
+        imageUrl = safeImageUrlSec,
         imageStoragePath = imageStoragePathSec,
         isPersistentNotification = (this["isPersistentNotification"] as? Boolean) ?: false,
         isArchived = (this["isArchived"] as? Boolean) ?: false

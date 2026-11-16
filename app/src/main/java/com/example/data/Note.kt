@@ -49,7 +49,7 @@ data class Note(
                 val local = localList.getOrNull(i)
                 val remote = remoteList.getOrNull(i)
                 if (local != null) {
-                    if (local.startsWith("http://") || local.startsWith("https://")) {
+                    if (local.startsWith("http://") || local.startsWith("https://") || local.startsWith("data:", ignoreCase = true)) {
                         list.add(local)
                     } else {
                         val path = if (local.startsWith("file://")) local.removePrefix("file://") else local
