@@ -9,12 +9,18 @@ import {
   AlertCircle,
   Loader2,
   ClipboardPaste,
+  Link2,
 } from 'lucide-react';
 import { FirebaseUserConfig } from '../types/note';
 import {
+  getEnvFirebaseConfig,
   getFirebaseConfigForEmail,
   parseFirebaseConfigSnippet,
 } from '../utils/firebaseClient';
+import {
+  lookupEncryptedConfigFromDirectory,
+  parseAnyAccountLinkOrCode,
+} from '../services/accountConfigService';
 
 interface SetupAuthScreenProps {
   initialConfig: FirebaseUserConfig | null;
@@ -34,14 +40,21 @@ export const SetupAuthScreen: React.FC<SetupAuthScreenProps> = ({
   isDark,
   onToggleTheme,
 }) => {
-  const [apiKey, setApiKey] = useState(initialConfig?.apiKey || '');
-  const [projectId, setProjectId] = useState(initialConfig?.projectId || '');
-  const [appId, setAppId] = useState(initialConfig?.appId || '');
-  const [storageBucket, setStorageBucket] = useState(initialConfig?.storageBucket || '');
+  const envDefaultConfig = getEnvFirebaseConfig();
+  const baseInitial = initialConfig || envDefaultConfig;
+
+  const [apiKey, setApiKey] = useState(baseInitial?.apiKey || '');
+  const [projectId, setProjectId] = useState(baseInitial?.projectId || '');
+  const [appId, setAppId] = useState(baseInitial?.appId || '');
+  const [storageBucket, setStorageBucket] = useState(baseInitial?.storageBucket || '');
 
   const [showSnippetBox, setShowSnippetBox] = useState(false);
   const [snippetText, setSnippetText] = useState('');
+
+  // For brand-new browsers when no baked-in VITE_FIREBASE_* or cloud directory entry exists
+  const [needsDeviceLink, setNeedsDeviceLink] = useState(false);
   const [showManualSignInConfig, setShowManualSignInConfig] = useState(false);
+  const [accountCodeInput, setAccountCodeInput] = useState('');
 
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
@@ -50,16 +63,53 @@ export const SetupAuthScreen: React.FC<SetupAuthScreenProps> = ({
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [infoMsg, setInfoMsg] = useState<string | null>(null);
 
+  const applyResolvedConfig = (cfg: FirebaseUserConfig) => {
+    setApiKey(cfg.apiKey);
+    setProjectId(cfg.projectId);
+    setAppId(cfg.appId);
+    setStorageBucket(cfg.storageBucket);
+  };
+
   const handleEmailChange = (val: string) => {
     setEmail(val);
-    // Automatically load saved Firebase config associated with these login credentials
-    const matched = getFirebaseConfigForEmail(val);
+    const matched = getFirebaseConfigForEmail(val) || envDefaultConfig;
     if (matched) {
-      setApiKey(matched.apiKey);
-      setProjectId(matched.projectId);
-      setAppId(matched.appId);
-      setStorageBucket(matched.storageBucket);
+      applyResolvedConfig(matched);
+      setNeedsDeviceLink(false);
     }
+  };
+
+  const handleApplyAccountCode = () => {
+    setErrorMsg(null);
+    const parsedFromCode = parseAnyAccountLinkOrCode(accountCodeInput);
+    if (parsedFromCode) {
+      applyResolvedConfig(parsedFromCode);
+      setNeedsDeviceLink(false);
+      setShowManualSignInConfig(false);
+      setAccountCodeInput('');
+      setInfoMsg(`Linked workspace "${parsedFromCode.projectId}". Click Sign In to continue.`);
+      return;
+    }
+
+    const parsedSnippet = parseFirebaseConfigSnippet(accountCodeInput);
+    if (parsedSnippet?.apiKey && parsedSnippet.projectId && parsedSnippet.appId) {
+      applyResolvedConfig({
+        apiKey: parsedSnippet.apiKey,
+        projectId: parsedSnippet.projectId,
+        appId: parsedSnippet.appId,
+        storageBucket:
+          parsedSnippet.storageBucket || `${parsedSnippet.projectId}.firebasestorage.app`,
+      });
+      setNeedsDeviceLink(false);
+      setShowManualSignInConfig(false);
+      setAccountCodeInput('');
+      setInfoMsg(`Linked workspace "${parsedSnippet.projectId}". Click Sign In to continue.`);
+      return;
+    }
+
+    setErrorMsg(
+      'Invalid Portable Account Code or Quick-Login Link. Copy it from PINotes Web Settings on an already-signed-in device.'
+    );
   };
 
   const handleParseSnippet = () => {
@@ -88,42 +138,77 @@ export const SetupAuthScreen: React.FC<SetupAuthScreenProps> = ({
       return;
     }
 
-    // Resolve saved config for Sign In automatically (no prompt unless completely absent on this device)
-    const savedForEmail = getFirebaseConfigForEmail(email) || initialConfig;
-    const effectiveApiKey = apiKey.trim() || savedForEmail?.apiKey || '';
-    const effectiveProjectId = projectId.trim() || savedForEmail?.projectId || '';
-    const effectiveAppId = appId.trim() || savedForEmail?.appId || '';
-    const effectiveBucket =
-      storageBucket.trim() ||
-      savedForEmail?.storageBucket ||
-      (effectiveProjectId ? `${effectiveProjectId}.firebasestorage.app` : '');
-
-    if (!effectiveApiKey || !effectiveProjectId || !effectiveAppId) {
-      if (authMode === 'signin') {
-        setShowManualSignInConfig(true);
-        setErrorMsg(
-          'No saved Firebase config found on this browser yet. Enter your Firebase project once below (or use a Quick-Login link from your other device).'
-        );
-      } else {
-        setErrorMsg('Please enter your Firebase API Key, Project ID, and App ID to create an account.');
-      }
-      return;
-    }
-
     setIsLoading(true);
     try {
-      await onConnect(
-        {
-          apiKey: effectiveApiKey,
-          projectId: effectiveProjectId,
-          appId: effectiveAppId,
-          storageBucket: effectiveBucket,
-        },
-        email.trim(),
-        password,
-        authMode
-      );
+      let effectiveConfig: FirebaseUserConfig | null = null;
+
+      // 1. If user entered a portable code inline without pressing Apply first
+      if (accountCodeInput.trim()) {
+        effectiveConfig = parseAnyAccountLinkOrCode(accountCodeInput);
+      }
+
+      // 2. Check form / per-email localStorage / baked-in VITE_FIREBASE_*
+      if (!effectiveConfig) {
+        const savedForEmail =
+          getFirebaseConfigForEmail(email) || initialConfig || envDefaultConfig;
+        const effectiveApiKey = apiKey.trim() || savedForEmail?.apiKey || '';
+        const effectiveProjectId = projectId.trim() || savedForEmail?.projectId || '';
+        const effectiveAppId = appId.trim() || savedForEmail?.appId || '';
+        const effectiveBucket =
+          storageBucket.trim() ||
+          savedForEmail?.storageBucket ||
+          (effectiveProjectId ? `${effectiveProjectId}.firebasestorage.app` : '');
+
+        if (effectiveApiKey && effectiveProjectId && effectiveAppId) {
+          effectiveConfig = {
+            apiKey: effectiveApiKey,
+            projectId: effectiveProjectId,
+            appId: effectiveAppId,
+            storageBucket: effectiveBucket,
+          };
+        }
+      }
+
+      // 3. On Sign In, also attempt encrypted cloud directory lookup using (email + password)
+      if (!effectiveConfig && authMode === 'signin') {
+        const recovered = await lookupEncryptedConfigFromDirectory(email, password);
+        if (recovered) {
+          effectiveConfig = recovered;
+          applyResolvedConfig(recovered);
+        }
+      }
+
+      if (!effectiveConfig) {
+        if (authMode === 'signin') {
+          setNeedsDeviceLink(true);
+          setErrorMsg(
+            'This is a fresh browser and this site deployment does not have a default Firebase project baked in yet. Paste your Quick-Login Link / Portable Account Code from your other device once (or enter your Firebase config manually below).'
+          );
+        } else {
+          setErrorMsg(
+            'Please enter your Firebase API Key, Project ID, and App ID to create a new account.'
+          );
+        }
+        return;
+      }
+
+      await onConnect(effectiveConfig, email.trim(), password, authMode);
     } catch (err: unknown) {
+      if (authMode === 'signin' && !showManualSignInConfig) {
+        const recovered = await lookupEncryptedConfigFromDirectory(email, password);
+        if (recovered && recovered.projectId !== projectId.trim()) {
+          try {
+            applyResolvedConfig(recovered);
+            await onConnect(recovered, email.trim(), password, authMode);
+            return;
+          } catch (retryErr: unknown) {
+            const retryMsg =
+              retryErr instanceof Error ? retryErr.message : 'Failed to connect to Firebase.';
+            setErrorMsg(retryMsg);
+            return;
+          }
+        }
+      }
       const msg = err instanceof Error ? err.message : 'Failed to connect to Firebase.';
       setErrorMsg(msg);
     } finally {
@@ -213,6 +298,7 @@ export const SetupAuthScreen: React.FC<SetupAuthScreenProps> = ({
               type="button"
               onClick={() => {
                 setAuthMode('signup');
+                setNeedsDeviceLink(false);
                 setErrorMsg(null);
               }}
               className="py-2 rounded-xl text-sm font-semibold transition-all cursor-pointer"
@@ -229,7 +315,7 @@ export const SetupAuthScreen: React.FC<SetupAuthScreenProps> = ({
             </button>
           </div>
 
-          {/* Saved Project Indicator on Sign In */}
+          {/* Ready Workspace Badge on Sign In */}
           {authMode === 'signin' && !showManualSignInConfig && projectId && (
             <div
               className="flex items-center justify-between px-3.5 py-2.5 rounded-2xl border text-xs"
@@ -254,7 +340,62 @@ export const SetupAuthScreen: React.FC<SetupAuthScreenProps> = ({
             </div>
           )}
 
-          {/* Firebase Config Section (Shown automatically only on Create Account, or if missing on new browser) */}
+          {/* First-Time New-Device Link (only shown if Sign In couldn't find any config yet) */}
+          {authMode === 'signin' && needsDeviceLink && !showManualSignInConfig && (
+            <div
+              className="rounded-2xl border p-4 space-y-3"
+              style={{
+                background: 'var(--bg-canvas)',
+                borderColor: 'var(--border-subtle)',
+              }}
+            >
+              <div className="flex items-center gap-2">
+                <Link2 className="w-4 h-4 shrink-0" style={{ color: 'var(--accent)' }} />
+                <div>
+                  <div className="text-xs font-bold">Link Account on This New Device</div>
+                  <div className="text-[11px] opacity-65">
+                    Paste your Portable Account Code or Quick-Login Link from Settings on your
+                    other device (one-time per browser).
+                  </div>
+                </div>
+              </div>
+
+              <div className="flex gap-2">
+                <input
+                  type="text"
+                  value={accountCodeInput}
+                  onChange={(e) => setAccountCodeInput(e.target.value)}
+                  placeholder="Paste PINOTES1:... code or Quick-Login URL"
+                  className="flex-1 rounded-xl px-3 py-2 text-xs font-mono border focus:outline-none"
+                  style={{
+                    background: 'var(--bg-surface)',
+                    borderColor: 'var(--border-subtle)',
+                  }}
+                />
+                <button
+                  type="button"
+                  onClick={handleApplyAccountCode}
+                  className="px-3 py-2 rounded-xl text-xs font-bold shrink-0 cursor-pointer"
+                  style={{
+                    background: 'var(--accent-container)',
+                    color: 'var(--accent-container-text)',
+                  }}
+                >
+                  Apply
+                </button>
+              </div>
+
+              <button
+                type="button"
+                onClick={() => setShowManualSignInConfig(true)}
+                className="text-[11px] underline opacity-70 hover:opacity-100 cursor-pointer"
+              >
+                Or enter Firebase Project ID &amp; API Key manually
+              </button>
+            </div>
+          )}
+
+          {/* Firebase Config Section (Shown on Create Account, or if user explicitly opens manual config) */}
           {shouldShowFirebaseForm && (
             <div
               className="rounded-2xl border overflow-hidden p-4 space-y-3"
@@ -270,8 +411,8 @@ export const SetupAuthScreen: React.FC<SetupAuthScreenProps> = ({
                     <div className="text-sm font-semibold">Firebase Project Details</div>
                     <div className="text-[11px] opacity-65">
                       {authMode === 'signup'
-                        ? 'Required for new accounts — saved automatically for future logins'
-                        : 'One-time setup on this browser'}
+                        ? 'Attached to your account & remembered across sessions'
+                        : 'One-time browser link'}
                     </div>
                   </div>
                 </div>
@@ -396,6 +537,7 @@ export const SetupAuthScreen: React.FC<SetupAuthScreenProps> = ({
                 <input
                   type="email"
                   required
+                  autoComplete="email"
                   value={email}
                   onChange={(e) => handleEmailChange(e.target.value)}
                   placeholder="you@example.com"
@@ -417,6 +559,7 @@ export const SetupAuthScreen: React.FC<SetupAuthScreenProps> = ({
                 <input
                   type="password"
                   required
+                  autoComplete={authMode === 'signin' ? 'current-password' : 'new-password'}
                   minLength={6}
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
@@ -468,8 +611,9 @@ export const SetupAuthScreen: React.FC<SetupAuthScreenProps> = ({
           </button>
 
           <p className="text-[11px] text-center opacity-60 leading-relaxed">
-            Your Firebase configuration is saved automatically with your login credentials so
-            returning sign-ins only require your email and password.
+            {authMode === 'signin'
+              ? 'Existing users sign in directly with email and password.'
+              : 'Your Firebase project details are linked to your account for seamless syncing.'}
           </p>
         </form>
       </div>

@@ -9,6 +9,7 @@ import {
 } from 'firebase/firestore';
 import { getStorage, FirebaseStorage } from 'firebase/storage';
 import { FirebaseUserConfig } from '../types/note';
+import { parseAnyAccountLinkOrCode } from '../services/accountConfigService';
 
 const CONFIG_STORAGE_KEY = 'pinotes_firebase_config_v1';
 const ACCOUNT_CONFIGS_KEY = 'pinotes_account_configs_v1';
@@ -31,17 +32,25 @@ function normalizeConfig(config: Partial<FirebaseUserConfig>): FirebaseUserConfi
 }
 
 /**
- * Checks URL hash (#fb=<base64>) for a quick-login config link shared from another device.
+ * Checks URL hash (#fb=<base64> or #account=<PINOTES1:...>) for a quick-login config link shared from another device.
  * If found, saves it to localStorage and strips the hash from the address bar.
  */
 export function importFirebaseConfigFromUrlHash(): FirebaseUserConfig | null {
   try {
     const hash = window.location.hash || '';
-    const match = hash.match(/[#&]fb=([^&]+)/);
+    const match = hash.match(/[#&](?:fb|account)=([^&]+)/);
     if (!match) return null;
-    const decoded = atob(decodeURIComponent(match[1]));
-    const parsed = JSON.parse(decoded) as Partial<FirebaseUserConfig>;
-    const normalized = normalizeConfig(parsed);
+
+    let normalized: FirebaseUserConfig | null = null;
+    const fromCode = parseAnyAccountLinkOrCode(hash);
+    if (fromCode) {
+      normalized = fromCode;
+    } else {
+      const decoded = atob(decodeURIComponent(match[1]));
+      const parsed = JSON.parse(decoded) as Partial<FirebaseUserConfig>;
+      normalized = normalizeConfig(parsed);
+    }
+
     if (normalized) {
       localStorage.setItem(CONFIG_STORAGE_KEY, JSON.stringify(normalized));
       window.history.replaceState(

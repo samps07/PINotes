@@ -12,9 +12,25 @@ import {
   Lock,
   Link,
   AlertCircle,
+  Sparkles,
+  KeyRound,
+  Code2,
+  ChevronDown,
+  ChevronUp,
+  Eye,
+  EyeOff,
+  RotateCcw,
 } from 'lucide-react';
 import { FirebaseUserConfig, WebPasscodeConfig } from '../types/note';
 import { buildQuickLoginUrl } from '../utils/firebaseClient';
+import { buildPortableAccountCode } from '../services/accountConfigService';
+import {
+  getWebAiApiKey,
+  getWebAiPrompt,
+  resetWebAiPrompt,
+  saveWebAiApiKey,
+  saveWebAiPrompt,
+} from '../services/aiAnalysisService';
 
 interface SettingsModalProps {
   isOpen: boolean;
@@ -30,6 +46,7 @@ interface SettingsModalProps {
   onManualSync: () => Promise<void>;
   onSignOut: () => Promise<void>;
   onForgetConfigAndSignOut: () => Promise<void>;
+  onNotify: (msg: string) => void;
 }
 
 export const SettingsModal: React.FC<SettingsModalProps> = ({
@@ -46,10 +63,19 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   onManualSync,
   onSignOut,
   onForgetConfigAndSignOut,
+  onNotify,
 }) => {
   const [copiedJson, setCopiedJson] = useState(false);
   const [copiedQuickLink, setCopiedQuickLink] = useState(false);
+  const [copiedAccountCode, setCopiedAccountCode] = useState(false);
   const [syncing, setSyncing] = useState(false);
+
+  // Web AI Analysis config (stored locally in browser so it can differ from Android app key)
+  const [aiKeyExpanded, setAiKeyExpanded] = useState(false);
+  const [aiPromptExpanded, setAiPromptExpanded] = useState(false);
+  const [aiApiKey, setAiApiKey] = useState(() => getWebAiApiKey());
+  const [showApiKey, setShowApiKey] = useState(false);
+  const [aiPrompt, setAiPrompt] = useState(() => getWebAiPrompt());
 
   // Passcode Lock management state
   const [lockMode, setLockMode] = useState<'none' | 'reset' | 'unset'>('none');
@@ -81,6 +107,13 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     await navigator.clipboard.writeText(url);
     setCopiedQuickLink(true);
     setTimeout(() => setCopiedQuickLink(false), 2500);
+  };
+
+  const copyAccountCode = async () => {
+    const code = buildPortableAccountCode(config);
+    await navigator.clipboard.writeText(code);
+    setCopiedAccountCode(true);
+    setTimeout(() => setCopiedAccountCode(false), 2500);
   };
 
   const handleSetPasscode = async (e: React.FormEvent) => {
@@ -166,7 +199,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     >
       <div
         onClick={(e) => e.stopPropagation()}
-        className="w-full max-w-md max-h-[90vh] overflow-y-auto rounded-3xl border shadow-2xl p-6 space-y-5"
+        className="w-full max-w-lg max-h-[90vh] overflow-y-auto rounded-3xl border shadow-2xl p-6 space-y-4"
         style={{
           background: 'var(--bg-surface)',
           borderColor: 'var(--border-subtle)',
@@ -198,6 +231,142 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           <div className="text-sm font-semibold break-all">{userEmail || 'Unknown'}</div>
           {userUid && (
             <div className="text-[11px] font-mono opacity-55 break-all">UID: {userUid}</div>
+          )}
+        </div>
+
+        {/* Web AI API Key Config (Independent from Android App) */}
+        <div
+          className="rounded-2xl p-4 border space-y-2.5"
+          style={{
+            background: 'var(--bg-canvas)',
+            borderColor: 'var(--border-subtle)',
+          }}
+        >
+          <button
+            type="button"
+            onClick={() => setAiKeyExpanded((v) => !v)}
+            className="w-full flex items-center justify-between gap-2 cursor-pointer text-left"
+          >
+            <div className="flex items-center gap-2 text-xs font-semibold">
+              <KeyRound className="w-4 h-4" style={{ color: 'var(--accent)' }} />
+              <span>AI API Key Config (OpenRouter / Groq)</span>
+            </div>
+            <div className="flex items-center gap-2">
+              <span
+                className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${
+                  aiApiKey.trim()
+                    ? 'bg-emerald-500/15 text-emerald-400'
+                    : 'bg-white/10 opacity-65'
+                }`}
+              >
+                {aiApiKey.trim() ? 'SET' : 'EMPTY'}
+              </span>
+              {aiKeyExpanded ? (
+                <ChevronUp className="w-4 h-4 opacity-60" />
+              ) : (
+                <ChevronDown className="w-4 h-4 opacity-60" />
+              )}
+            </div>
+          </button>
+
+          {aiKeyExpanded && (
+            <div className="space-y-2.5 pt-1">
+              <div className="relative">
+                <input
+                  type={showApiKey ? 'text' : 'password'}
+                  value={aiApiKey}
+                  onChange={(e) => {
+                    const next = e.target.value;
+                    setAiApiKey(next);
+                    saveWebAiApiKey(next);
+                  }}
+                  placeholder="Enter OpenRouter (sk-or-...) or Groq (gsk_...) key"
+                  className="w-full rounded-xl pl-3 pr-9 py-2 text-xs font-mono border focus:outline-none"
+                  style={{
+                    background: 'var(--bg-surface)',
+                    borderColor: 'var(--border-subtle)',
+                  }}
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowApiKey((v) => !v)}
+                  title={showApiKey ? 'Hide key' : 'Show key'}
+                  className="absolute right-2.5 top-1/2 -translate-y-1/2 opacity-65 hover:opacity-100 cursor-pointer"
+                >
+                  {showApiKey ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+                </button>
+              </div>
+              <p className="text-[11px] opacity-65 leading-relaxed">
+                Stored only in this browser so you can use a different OpenRouter (`sk-or-...`) or
+                Groq (`gsk_...`) API key on Web vs. your Android app.
+              </p>
+            </div>
+          )}
+        </div>
+
+        {/* Edit AI Analysis Prompt */}
+        <div
+          className="rounded-2xl p-4 border space-y-2.5"
+          style={{
+            background: 'var(--bg-canvas)',
+            borderColor: 'var(--border-subtle)',
+          }}
+        >
+          <button
+            type="button"
+            onClick={() => setAiPromptExpanded((v) => !v)}
+            className="w-full flex items-center justify-between gap-2 cursor-pointer text-left"
+          >
+            <div className="flex items-center gap-2 text-xs font-semibold">
+              <Code2 className="w-4 h-4" style={{ color: 'var(--accent)' }} />
+              <span>Edit AI Analysis Prompt</span>
+            </div>
+            {aiPromptExpanded ? (
+              <ChevronUp className="w-4 h-4 opacity-60" />
+            ) : (
+              <ChevronDown className="w-4 h-4 opacity-60" />
+            )}
+          </button>
+
+          {aiPromptExpanded && (
+            <div className="space-y-2.5 pt-1">
+              <div className="flex items-center justify-between">
+                <span className="text-[11px] font-semibold opacity-70">
+                  Custom System Instructions
+                </span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    const def = resetWebAiPrompt();
+                    setAiPrompt(def);
+                    onNotify('Reset AI analysis prompt to default');
+                  }}
+                  className="inline-flex items-center gap-1 text-[11px] font-semibold px-2 py-1 rounded-lg hover:bg-white/10 cursor-pointer"
+                  style={{ color: 'var(--accent)' }}
+                >
+                  <RotateCcw className="w-3 h-3" />
+                  Reset to Default
+                </button>
+              </div>
+
+              <textarea
+                value={aiPrompt}
+                onChange={(e) => {
+                  setAiPrompt(e.target.value);
+                  saveWebAiPrompt(e.target.value);
+                }}
+                rows={7}
+                className="w-full rounded-xl p-3 text-xs font-mono border focus:outline-none leading-relaxed"
+                style={{
+                  background: 'var(--bg-surface)',
+                  borderColor: 'var(--border-subtle)',
+                }}
+              />
+              <p className="text-[11px] opacity-65 leading-relaxed">
+                Changes apply immediately whenever AI Analysis curates links or notes on the web
+                app.
+              </p>
+            </div>
           )}
         </div>
 
@@ -442,24 +611,51 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             Bucket: {config.storageBucket}
           </div>
 
-          <button
-            type="button"
-            onClick={copyQuickLoginLink}
-            className="w-full py-2 px-3 rounded-xl text-xs font-medium border flex items-center justify-center gap-1.5 hover:bg-white/5 cursor-pointer"
-            style={{ borderColor: 'var(--border-subtle)' }}
-          >
-            {copiedQuickLink ? (
-              <>
-                <Check className="w-3.5 h-3.5 text-emerald-400" />
-                Quick-Login Link Copied!
-              </>
-            ) : (
-              <>
-                <Link className="w-3.5 h-3.5" />
-                Copy Quick-Login Link for Other Devices
-              </>
-            )}
-          </button>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 pt-0.5">
+            <button
+              type="button"
+              onClick={copyQuickLoginLink}
+              className="py-2 px-3 rounded-xl text-xs font-medium border flex items-center justify-center gap-1.5 hover:bg-white/5 cursor-pointer"
+              style={{ borderColor: 'var(--border-subtle)' }}
+            >
+              {copiedQuickLink ? (
+                <>
+                  <Check className="w-3.5 h-3.5 text-emerald-400" />
+                  Link Copied!
+                </>
+              ) : (
+                <>
+                  <Link className="w-3.5 h-3.5" />
+                  Copy Quick-Login Link
+                </>
+              )}
+            </button>
+
+            <button
+              type="button"
+              onClick={copyAccountCode}
+              className="py-2 px-3 rounded-xl text-xs font-medium border flex items-center justify-center gap-1.5 hover:bg-white/5 cursor-pointer"
+              style={{ borderColor: 'var(--border-subtle)' }}
+            >
+              {copiedAccountCode ? (
+                <>
+                  <Check className="w-3.5 h-3.5 text-emerald-400" />
+                  Code Copied!
+                </>
+              ) : (
+                <>
+                  <Sparkles className="w-3.5 h-3.5" />
+                  Copy Account Code
+                </>
+              )}
+            </button>
+          </div>
+
+          <p className="text-[10px] opacity-60 leading-relaxed">
+            Tip: For automatic Email+Password Sign In on any brand-new browser with zero prompts,
+            set <code>VITE_FIREBASE_API_KEY</code>, <code>VITE_FIREBASE_PROJECT_ID</code>, and{' '}
+            <code>VITE_FIREBASE_APP_ID</code> in your GitHub Repository Variables.
+          </p>
         </div>
 
         {/* Actions */}
@@ -492,7 +688,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             style={{ borderColor: 'var(--border-subtle)' }}
           >
             <LogOut className="w-4 h-4" />
-            Sign Out (Keep Firebase Config)
+            Sign Out (Keep Account Config)
           </button>
 
           <button

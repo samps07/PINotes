@@ -31,8 +31,9 @@ To sign in from your GitHub Pages website:
 3. Add `<your-github-username>.github.io`.
 4. First time setup: switch to **Create Account** (if new) or expand Firebase config on **Sign In**, enter your Firebase config once, and sign in. Your browser remembers your Firebase config per email so subsequent **Sign In** attempts only ask for Email & Password.
 5. **Signing in on another device (phone/tablet) without re-typing Firebase config:**
-   - **Option A (Quick-Login Link):** In PINotes Web **Settings** → click **Copy Quick-Login Link for Other Devices** and open it on your phone/laptop.
-   - **Option B (Optional GitHub Repo Variables):** In GitHub repo → **Settings → Secrets and variables → Actions → Variables**, add `VITE_FIREBASE_API_KEY`, `VITE_FIREBASE_PROJECT_ID`, `VITE_FIREBASE_APP_ID`, and `VITE_FIREBASE_STORAGE_BUCKET` so every fresh device defaults to your Firebase project automatically.
+   - **Option A (Quick-Login Link or Account Code):** In PINotes Web **Settings** → click **Copy Quick-Login Link** (open it on your phone/laptop) or **Copy Account Code** (`PINOTES1:...`) and paste it once on the Sign In screen.
+   - **Option B (Zero-Prompt Across All Devices — Recommended):** In GitHub repo → **Settings → Secrets and variables → Actions → Variables**, add `VITE_FIREBASE_API_KEY`, `VITE_FIREBASE_PROJECT_ID`, `VITE_FIREBASE_APP_ID`, and `VITE_FIREBASE_STORAGE_BUCKET` (or `VITE_REGISTRY_FIREBASE_*` for multi-project directory discovery) so every brand-new device signs in immediately with only Email & Password.
+6. **Web AI Analysis API Key:** Open **Settings** on the Web dashboard → **AI API Key Config (OpenRouter / Groq)** to save a browser-local API key (`sk-or-...` or `gsk_...`) and optionally customize the AI system prompt independently of your Android app.
 
 ---
 

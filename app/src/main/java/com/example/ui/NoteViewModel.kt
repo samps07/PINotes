@@ -191,6 +191,7 @@ class NoteViewModel(val repository: NoteRepository, private val context: Context
 
             viewModelScope.launch {
                 repository.updateCategoryName(oldName, trimmed)
+                SyncManager.triggerSyncNow(context, repository)
             }
         }
     }
@@ -203,6 +204,7 @@ class NoteViewModel(val repository: NoteRepository, private val context: Context
             currentList.add(trimmed)
             _tags.value = currentList
             CategoryPrefs.saveTags(context, currentList)
+            SyncManager.triggerSyncNow(context, repository)
         }
     }
 
@@ -214,12 +216,14 @@ class NoteViewModel(val repository: NoteRepository, private val context: Context
             currentList.add(trimmed)
             _categories.value = currentList
             CategoryPrefs.saveCategories(context, currentList)
+            SyncManager.triggerSyncNow(context, repository)
         }
     }
 
     fun saveNewCategoryOrder(newOrder: List<String>) {
         _categories.value = newOrder
         CategoryPrefs.saveCategories(context, newOrder)
+        SyncManager.triggerSyncNow(context, repository)
     }
 
     fun deleteCategory(categoryName: String) {
@@ -230,6 +234,7 @@ class NoteViewModel(val repository: NoteRepository, private val context: Context
             if (selectedCategory.value == categoryName) {
                 selectedCategory.value = null
             }
+            SyncManager.triggerSyncNow(context, repository)
         }
     }
 

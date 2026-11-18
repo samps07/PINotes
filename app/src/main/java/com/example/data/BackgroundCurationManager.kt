@@ -68,19 +68,19 @@ object BackgroundCurationManager {
                         )
                         dao.updateNote(updatedNote)
 
-                        // Trigger cloud sync so background curation result syncs across devices
-                        val repo = NoteRepository(dao)
-                        com.example.sync.SyncManager.triggerSyncNow(appContext, repo)
-
-                        // Sync newly extracted category with Suggestion Preferences (categories still sync, but not tags)
+                        // Sync newly extracted category with Suggestion Preferences BEFORE triggering cloud sync
                         if (!metadata.category.isNullOrEmpty()) {
                             val currentCats = CategoryPrefs.getCategories(appContext).toMutableList()
                             val cleanCat = metadata.category.trim()
-                            if (cleanCat.isNotEmpty() && !currentCats.contains(cleanCat)) {
+                            if (cleanCat.isNotEmpty() && currentCats.none { it.equals(cleanCat, ignoreCase = true) }) {
                                 currentCats.add(cleanCat)
                                 CategoryPrefs.saveCategories(appContext, currentCats)
                             }
                         }
+
+                        // Trigger cloud sync so background curation result and category sync across devices
+                        val repo = NoteRepository(dao)
+                        com.example.sync.SyncManager.triggerSyncNow(appContext, repo)
 
                         // Only update the active notification if it was already pushed/active
                         val notificationManager = appContext.getSystemService(Context.NOTIFICATION_SERVICE) as? android.app.NotificationManager

@@ -29,6 +29,7 @@ import {
 import {
   permanentlyDeleteNote,
   refreshNotesOnce,
+  refreshPreferencesOnce,
   saveNoteToFirestore,
   savePreferencesToFirestore,
   subscribeToNotes,
@@ -44,6 +45,10 @@ import {
   unsetWebPasscode,
   verifyWebPasscode,
 } from './services/webLockService';
+import {
+  saveAccountFirebaseConfigToUserDoc,
+  saveEncryptedConfigToDirectory,
+} from './services/accountConfigService';
 import { stripRichTagsToPlainText } from './utils/richText';
 import { SetupAuthScreen } from './components/SetupAuthScreen';
 import { PasscodeLockScreen } from './components/PasscodeLockScreen';
@@ -52,11 +57,19 @@ import { Sidebar } from './components/Sidebar';
 import { QuickCaptureBar } from './components/QuickCaptureBar';
 import { NoteCard } from './components/NoteCard';
 import { NoteEditorModal } from './components/NoteEditorModal';
-import { LightboxModal } from './components/LightboxModal';
+import { AttachmentPreviewModal, PreviewTarget } from './components/AttachmentPreviewModal';
 import { SettingsModal } from './components/SettingsModal';
 
 const THEME_KEY = 'pinotes_theme_v1';
 const VIEW_KEY = 'pinotes_grid_view_v1';
+
+function splitNoteTags(raw: string | null | undefined): string[] {
+  if (!raw) return [];
+  return raw
+    .split(/[|,]+/)
+    .map((t) => t.trim().replace(/^#/, '').trim())
+    .filter(Boolean);
+}
 
 export function App() {
   const [isDark, setIsDark] = useState<boolean>(() => {
@@ -88,8 +101,8 @@ export function App() {
   const [isWebUnlocked, setIsWebUnlocked] = useState<boolean>(false);
 
   const [notes, setNotes] = useState<NoteDocument[]>([]);
-  const [categories, setCategories] = useState<string[]>(DEFAULT_CATEGORIES);
-  const [tags, setTags] = useState<string[]>(DEFAULT_TAGS);
+  const [prefCategories, setPrefCategories] = useState<string[]>(DEFAULT_CATEGORIES);
+  const [prefTags, setPrefTags] = useState<string[]>(DEFAULT_TAGS);
   const [syncStatus, setSyncStatus] = useState<SyncStatus>('OFFLINE');
 
   const [sidebarOpen, setSidebarOpen] = useState<boolean>(() =>
@@ -99,7 +112,7 @@ export function App() {
   const [searchQuery, setSearchQuery] = useState('');
 
   const [editingNote, setEditingNote] = useState<NoteDocument | null>(null);
-  const [lightboxUrl, setLightboxUrl] = useState<string | null>(null);
+  const [previewTarget, setPreviewTarget] = useState<PreviewTarget | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [toastMsg, setToastMsg] = useState<string | null>(null);
 
@@ -149,6 +162,7 @@ export function App() {
             const cached = loadCachedWebLock(user.uid);
             if (cached) setWebLock(cached);
             setWebLockLoading(true);
+            saveFirebaseConfig(firebaseConfig, user.email || undefined);
           } else {
             setIsWebUnlocked(false);
             setWebLock({ enabled: false, passcodeHash: null, updatedAt: 0 });
@@ -171,7 +185,7 @@ export function App() {
     };
   }, [firebaseConfig]);
 
-  // Subscribe to Firestore notes, preferences & web security lock when authenticated
+  // Subscribe in real time to Firestore notes, preferences, & web security lock
   useEffect(() => {
     if (!db || !currentUser) {
       setNotes([]);
@@ -193,9 +207,9 @@ export function App() {
       }
     );
 
-    const unsubPrefs = subscribeToPreferences(db, currentUser.uid, (cats, tgs) => {
-      setCategories(cats);
-      setTags(tgs);
+    const unsubPrefs = subscribeToPreferences(db, currentUser.uid, (prefs) => {
+      setPrefCategories(prefs.categories);
+      setPrefTags(prefs.tags);
     });
 
     const unsubLock = subscribeToWebLock(db, currentUser.uid, (cfg) => {
@@ -210,6 +224,53 @@ export function App() {
     };
   }, [db, currentUser, notify]);
 
+  // Merge Firestore preferences with any categories/tags discovered directly on synced notes in real time
+  const categories = useMemo(() => {
+    const result: string[] = [];
+    const seenLower = new Set<string>();
+    const addUnique = (raw: string | null | undefined) => {
+      const clean = (raw || '').trim();
+      if (!clean) return;
+      const lower = clean.toLowerCase();
+      if (!seenLower.has(lower)) {
+        seenLower.add(lower);
+        result.push(clean);
+      }
+    };
+
+    prefCategories.forEach(addUnique);
+    notes.forEach((n) => {
+      if (n.deletedAt === null) addUnique(n.category);
+    });
+    if (!seenLower.has('general')) {
+      result.unshift('General');
+    }
+    return result;
+  }, [prefCategories, notes]);
+
+  const tags = useMemo(() => {
+    const result: string[] = [];
+    const seenLower = new Set<string>();
+    const addUnique = (raw: string | null | undefined) => {
+      const clean = (raw || '').trim().replace(/^#/, '').trim();
+      if (!clean) return;
+      const lower = clean.toLowerCase();
+      if (!seenLower.has(lower)) {
+        seenLower.add(lower);
+        result.push(clean);
+      }
+    };
+
+    prefTags.forEach(addUnique);
+    notes.forEach((n) => {
+      if (n.deletedAt === null) {
+        splitNoteTags(n.tags).forEach(addUnique);
+        splitNoteTags(n.autoTags).forEach(addUnique);
+      }
+    });
+    return result;
+  }, [prefTags, notes]);
+
   const handleConnect = async (
     config: FirebaseUserConfig,
     email: string,
@@ -219,30 +280,35 @@ export function App() {
     const saved = saveFirebaseConfig(config, email);
     const instances = await getOrInitFirebaseInstances(saved);
 
-    if (mode === 'signin') {
-      await signInWithEmailAndPassword(instances.auth, email, password);
-    } else {
-      await createUserWithEmailAndPassword(instances.auth, email, password);
-    }
+    const cred =
+      mode === 'signin'
+        ? await signInWithEmailAndPassword(instances.auth, email, password)
+        : await createUserWithEmailAndPassword(instances.auth, email, password);
 
     setFirebaseApp(instances.app);
     setDb(instances.db);
     setStorage(instances.storage);
     setFirebaseConfig(saved);
+
+    if (cred.user) {
+      void saveAccountFirebaseConfigToUserDoc(instances.db, cred.user.uid, email, saved);
+      void saveEncryptedConfigToDirectory(email, password, saved);
+    }
   };
 
   const handleManualSync = async () => {
     if (!db || !currentUser) return;
     setSyncStatus('SYNCING');
     try {
-      const fresh = await refreshNotesOnce(db, currentUser.uid);
-      fresh.sort((a, b) => {
-        if (a.isPinned !== b.isPinned) return a.isPinned ? -1 : 1;
-        return (b.updatedAt || b.timestamp) - (a.updatedAt || a.timestamp);
-      });
-      setNotes(fresh);
+      const [freshNotes, freshPrefs] = await Promise.all([
+        refreshNotesOnce(db, currentUser.uid),
+        refreshPreferencesOnce(db, currentUser.uid),
+      ]);
+      setNotes(freshNotes);
+      setPrefCategories(freshPrefs.categories);
+      setPrefTags(freshPrefs.tags);
       setSyncStatus('SYNCED');
-      notify('Notes synced from cloud');
+      notify('Notes, categories & tags synced from cloud');
     } catch {
       setSyncStatus('ERROR');
       notify('Failed to refresh notes');
@@ -310,20 +376,35 @@ export function App() {
     setIsWebUnlocked(false);
   };
 
+  const handleEnsureCategory = async (name: string) => {
+    const clean = name.trim();
+    if (!clean || !db || !currentUser) return;
+    if (prefCategories.some((c) => c.toLowerCase() === clean.toLowerCase())) return;
+    const next = [...categories];
+    if (!next.some((c) => c.toLowerCase() === clean.toLowerCase())) {
+      next.push(clean);
+    }
+    setPrefCategories(next);
+    await savePreferencesToFirestore(db, currentUser.uid, next, prefTags);
+  };
+
   const handleCreateNote = async (
     draft: Partial<NoteDocument>,
-    filesToUpload: File[] = []
+    imageFiles: File[] = [],
+    otherFiles: File[] = []
   ) => {
     if (!db || !storage || !currentUser) return;
     const now = Date.now();
     const noteId = crypto.randomUUID ? crypto.randomUUID() : `web_${now}_${Math.random()}`;
 
     const uploadedAttachments = [];
-    const uploadedUrls: string[] = [];
+    const uploadedUrls: string[] = draft.imageUrl
+      ? draft.imageUrl.split('|').map((u) => u.trim()).filter(Boolean)
+      : [];
     const uploadedPaths: string[] = [];
     let usedInlineFallback = false;
 
-    for (const file of filesToUpload) {
+    for (const file of imageFiles) {
       const res = await uploadImageForNote(
         storage,
         currentUser.uid,
@@ -334,8 +415,27 @@ export function App() {
       );
       if (res.usedInlineFallback) usedInlineFallback = true;
       uploadedAttachments.push(res.attachment);
-      uploadedUrls.push(res.downloadUrl);
+      if (res.downloadUrl && !uploadedUrls.includes(res.downloadUrl)) {
+        uploadedUrls.push(res.downloadUrl);
+      }
       if (res.storagePath) uploadedPaths.push(res.storagePath);
+    }
+
+    for (const file of otherFiles) {
+      const att = await uploadFileForNote(
+        storage,
+        currentUser.uid,
+        noteId,
+        file,
+        undefined,
+        firebaseApp
+      );
+      uploadedAttachments.push(att);
+    }
+
+    const noteCategory = draft.category?.trim() || 'General';
+    if (noteCategory.toLowerCase() !== 'general') {
+      await handleEnsureCategory(noteCategory);
     }
 
     const newNote: NoteDocument = {
@@ -343,7 +443,7 @@ export function App() {
       title: draft.title || 'Untitled Note',
       content: draft.content || '',
       timestamp: now,
-      category: draft.category || 'General',
+      category: noteCategory,
       colorIndex: draft.colorIndex ?? 0,
       isPinned: draft.isPinned ?? false,
       attachments: uploadedAttachments,
@@ -359,7 +459,7 @@ export function App() {
         activeSection.type === 'tag'
           ? activeSection.value
           : draft.tags ?? null,
-      autoTags: null,
+      autoTags: draft.autoTags ?? null,
       createdAt: now,
       updatedAt: now,
       deletedAt: null,
@@ -373,7 +473,7 @@ export function App() {
     await saveNoteToFirestore(db, currentUser.uid, newNote);
     setSyncStatus('SYNCED');
     notify(
-      usedInlineFallback && filesToUpload.length > 0
+      usedInlineFallback && imageFiles.length > 0
         ? 'Image note saved & synced with Firestore'
         : 'Note saved and synced'
     );
@@ -382,8 +482,13 @@ export function App() {
   const handleSaveNote = async (updated: NoteDocument) => {
     if (!db || !currentUser) return;
     setSyncStatus('SYNCING');
+    const normalizedCategory = updated.category?.trim() || 'General';
+    if (normalizedCategory.toLowerCase() !== 'general') {
+      await handleEnsureCategory(normalizedCategory);
+    }
     await saveNoteToFirestore(db, currentUser.uid, {
       ...updated,
+      category: normalizedCategory,
       updatedAt: Date.now(),
     });
     setSyncStatus('SYNCED');
@@ -441,48 +546,101 @@ export function App() {
   };
 
   const handleAddCategory = async (name: string) => {
-    if (!db || !currentUser || categories.includes(name)) return;
-    const next = [...categories, name];
-    setCategories(next);
-    await savePreferencesToFirestore(db, currentUser.uid, next, tags);
-    notify(`Category "${name}" added`);
+    const clean = name.trim();
+    if (!db || !currentUser || !clean) return;
+    if (categories.some((c) => c.toLowerCase() === clean.toLowerCase())) return;
+    const next = [...categories, clean];
+    setPrefCategories(next);
+    await savePreferencesToFirestore(db, currentUser.uid, next, prefTags);
+    notify(`Category "${clean}" synced`);
   };
 
   const handleDeleteCategory = async (name: string) => {
     if (!db || !currentUser) return;
-    const next = categories.filter((c) => c !== name);
-    setCategories(next);
-    if (activeSection.type === 'category' && activeSection.value === name) {
+    const lower = name.toLowerCase();
+    const next = categories.filter((c) => c.toLowerCase() !== lower);
+    setPrefCategories(next);
+    if (activeSection.type === 'category' && activeSection.value.toLowerCase() === lower) {
       setActiveSection({ type: 'notes' });
     }
-    await savePreferencesToFirestore(db, currentUser.uid, next, tags);
+    await savePreferencesToFirestore(db, currentUser.uid, next, prefTags);
+
+    // Move notes in deleted category back to 'General' so it stays cleanly deleted
+    const affected = notes.filter((n) => n.deletedAt === null && n.category.toLowerCase() === lower);
+    for (const n of affected) {
+      await saveNoteToFirestore(db, currentUser.uid, {
+        ...n,
+        category: 'General',
+        updatedAt: Date.now(),
+      });
+    }
   };
 
   const handleAddTag = async (name: string) => {
-    if (!db || !currentUser || tags.includes(name)) return;
-    const next = [...tags, name];
-    setTags(next);
-    await savePreferencesToFirestore(db, currentUser.uid, categories, next);
-    notify(`Tag "#${name}" added`);
+    const clean = name.trim().replace(/^#/, '').trim();
+    if (!db || !currentUser || !clean) return;
+    if (tags.some((t) => t.toLowerCase() === clean.toLowerCase())) return;
+    const next = [...tags, clean];
+    setPrefTags(next);
+    await savePreferencesToFirestore(db, currentUser.uid, prefCategories, next);
+    notify(`Tag "#${clean}" synced`);
   };
 
   const handleDeleteTag = async (name: string) => {
     if (!db || !currentUser) return;
-    const next = tags.filter((t) => t !== name);
-    setTags(next);
-    if (activeSection.type === 'tag' && activeSection.value === name) {
+    const lower = name.toLowerCase();
+    const next = tags.filter((t) => t.toLowerCase() !== lower);
+    setPrefTags(next);
+    if (activeSection.type === 'tag' && activeSection.value.toLowerCase() === lower) {
       setActiveSection({ type: 'notes' });
     }
-    await savePreferencesToFirestore(db, currentUser.uid, categories, next);
+    await savePreferencesToFirestore(db, currentUser.uid, prefCategories, next);
+
+    // Remove the deleted tag from notes that hold it so it stays removed across real-time sync
+    for (const n of notes) {
+      const mTags = splitNoteTags(n.tags);
+      const aTags = splitNoteTags(n.autoTags);
+      const hasMatch =
+        mTags.some((t) => t.toLowerCase() === lower) ||
+        aTags.some((t) => t.toLowerCase() === lower);
+      if (hasMatch) {
+        const nextManual = mTags.filter((t) => t.toLowerCase() !== lower);
+        const nextAuto = aTags.filter((t) => t.toLowerCase() !== lower);
+        await saveNoteToFirestore(db, currentUser.uid, {
+          ...n,
+          tags: nextManual.length > 0 ? nextManual.join('|') : null,
+          autoTags: nextAuto.length > 0 ? nextAuto.join('|') : null,
+          updatedAt: Date.now(),
+        });
+      }
+    }
   };
 
   const counts = useMemo(() => {
     const active = notes.filter((n) => n.deletedAt === null && !n.isArchived);
+    const catCounts: Record<string, number> = {};
+    const tCounts: Record<string, number> = {};
+
+    for (const n of active) {
+      const cKey = (n.category || 'General').trim().toLowerCase();
+      catCounts[cKey] = (catCounts[cKey] || 0) + 1;
+
+      const noteTagSet = new Set([
+        ...splitNoteTags(n.tags).map((t) => t.toLowerCase()),
+        ...splitNoteTags(n.autoTags).map((t) => t.toLowerCase()),
+      ]);
+      noteTagSet.forEach((tk) => {
+        tCounts[tk] = (tCounts[tk] || 0) + 1;
+      });
+    }
+
     return {
       notes: active.length,
       scheduled: active.filter((n) => n.isScheduled && n.scheduledTime !== null).length,
       archive: notes.filter((n) => n.deletedAt === null && n.isArchived).length,
       trash: notes.filter((n) => n.deletedAt !== null).length,
+      categories: catCounts,
+      tags: tCounts,
     };
   }, [notes]);
 
@@ -490,7 +648,6 @@ export function App() {
     const q = searchQuery.trim().toLowerCase();
 
     return notes.filter((note) => {
-      // Section filter
       if (activeSection.type === 'trash') {
         if (note.deletedAt === null) return false;
       } else if (activeSection.type === 'archive') {
@@ -500,13 +657,16 @@ export function App() {
         if (activeSection.type === 'scheduled') {
           if (!note.isScheduled || note.scheduledTime === null) return false;
         } else if (activeSection.type === 'category') {
-          if (note.category !== activeSection.value) return false;
+          if (note.category.trim().toLowerCase() !== activeSection.value.trim().toLowerCase()) {
+            return false;
+          }
         } else if (activeSection.type === 'tag') {
+          const targetTag = activeSection.value.trim().replace(/^#/, '').toLowerCase();
           const allTags = [
-            ...(note.tags ? note.tags.split('|') : []),
-            ...(note.autoTags ? note.autoTags.split('|') : []),
-          ].map((t) => t.trim());
-          if (!allTags.includes(activeSection.value)) return false;
+            ...splitNoteTags(note.tags),
+            ...splitNoteTags(note.autoTags),
+          ].map((t) => t.toLowerCase());
+          if (!allTags.includes(targetTag)) return false;
         }
       }
 
@@ -650,6 +810,9 @@ export function App() {
                 activeSection.type === 'category' ? activeSection.value : 'General'
               }
               onCreateNote={handleCreateNote}
+              onEnsureCategory={handleEnsureCategory}
+              onOpenSettings={() => setSettingsOpen(true)}
+              onNotify={notify}
             />
           )}
 
@@ -706,8 +869,10 @@ export function App() {
                         <NoteCard
                           note={note}
                           isDark={isDark}
+                          storage={storage}
+                          firebaseApp={firebaseApp}
                           onOpen={() => setEditingNote(note)}
-                          onImageClick={(url) => setLightboxUrl(url)}
+                          onAttachmentClick={(target) => setPreviewTarget(target)}
                           onTogglePin={() => handleTogglePin(note)}
                           onChangeColor={(c) => handleChangeColor(note, c)}
                           onToggleArchive={() => handleToggleArchive(note)}
@@ -739,8 +904,10 @@ export function App() {
                         <NoteCard
                           note={note}
                           isDark={isDark}
+                          storage={storage}
+                          firebaseApp={firebaseApp}
                           onOpen={() => setEditingNote(note)}
-                          onImageClick={(url) => setLightboxUrl(url)}
+                          onAttachmentClick={(target) => setPreviewTarget(target)}
                           onTogglePin={() => handleTogglePin(note)}
                           onChangeColor={(c) => handleChangeColor(note, c)}
                           onToggleArchive={() => handleToggleArchive(note)}
@@ -767,10 +934,13 @@ export function App() {
         <NoteEditorModal
           note={editingNote}
           isDark={isDark}
+          storage={storage}
+          firebaseApp={firebaseApp}
           categories={categories}
           tags={tags}
           onClose={() => setEditingNote(null)}
           onSave={handleSaveNote}
+          onEnsureCategory={handleEnsureCategory}
           onUploadImage={(noteId, file) =>
             uploadImageForNote(
               storage!,
@@ -782,18 +952,31 @@ export function App() {
             )
           }
           onUploadFile={(noteId, file) =>
-            uploadFileForNote(storage!, currentUser.uid, noteId, file)
+            uploadFileForNote(
+              storage!,
+              currentUser.uid,
+              noteId,
+              file,
+              undefined,
+              firebaseApp
+            )
           }
           onDeleteStoragePath={(path) => deleteStoragePathSafe(storage!, path)}
           onToggleArchive={handleToggleArchive}
           onSoftDelete={handleSoftDelete}
-          onImageClick={(url) => setLightboxUrl(url)}
+          onAttachmentClick={(target) => setPreviewTarget(target)}
+          onOpenSettings={() => setSettingsOpen(true)}
           onNotify={notify}
         />
       )}
 
-      {/* Lightbox */}
-      <LightboxModal imageUrl={lightboxUrl} onClose={() => setLightboxUrl(null)} />
+      {/* Rich Attachment & Image Lightbox Modal */}
+      <AttachmentPreviewModal
+        target={previewTarget}
+        storage={storage}
+        firebaseApp={firebaseApp}
+        onClose={() => setPreviewTarget(null)}
+      />
 
       {/* Settings Modal */}
       <SettingsModal
@@ -810,12 +993,13 @@ export function App() {
         onManualSync={handleManualSync}
         onSignOut={handleSignOut}
         onForgetConfigAndSignOut={handleForgetConfigAndSignOut}
+        onNotify={notify}
       />
 
       {/* Toast Notification */}
       {toastMsg && (
         <div
-          className="fixed bottom-5 left-1/2 -translate-x-1/2 z-[70] px-4 py-2.5 rounded-2xl text-xs font-semibold shadow-2xl border"
+          className="fixed bottom-5 left-1/2 -translate-x-1/2 z-[80] px-4 py-2.5 rounded-2xl text-xs font-semibold shadow-2xl border"
           style={{
             background: 'var(--bg-surface-elevated)',
             color: 'var(--text-primary)',

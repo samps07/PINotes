@@ -1,4 +1,6 @@
 import React, { useState, useRef } from 'react';
+import { FirebaseStorage } from 'firebase/storage';
+import { FirebaseApp } from 'firebase/app';
 import {
   X,
   Pin,
@@ -15,6 +17,8 @@ import {
   Loader2,
   ExternalLink,
   Sparkles,
+  AlertCircle,
+  Download,
 } from 'lucide-react';
 import {
   getNoteColors,
@@ -25,18 +29,28 @@ import {
 import { RichTextEditor } from './RichTextEditor';
 import { TableChecklistEditor } from './TableChecklistEditor';
 import {
+  formatFileSize,
   getNoteFileAttachments,
-  getNoteImageUrls,
+  getNoteImageEntries,
+  isImageFileOrAttachment,
+  NoteImageEntry,
+  triggerAttachmentDownload,
 } from '../services/notesService';
 import { formatNoteForCopying } from '../utils/tableParser';
+import { SmartNoteImage } from './SmartNoteImage';
+import { PreviewTarget } from './AttachmentPreviewModal';
+import { analyzeWithAi } from '../services/aiAnalysisService';
 
 interface NoteEditorModalProps {
   note: NoteDocument;
   isDark: boolean;
+  storage?: FirebaseStorage | null;
+  firebaseApp?: FirebaseApp | null;
   categories: string[];
   tags: string[];
   onClose: () => void;
   onSave: (updated: NoteDocument) => Promise<void>;
+  onEnsureCategory: (category: string) => Promise<void>;
   onUploadImage: (noteId: string, file: File) => Promise<{
     downloadUrl: string;
     storagePath: string;
@@ -47,23 +61,28 @@ interface NoteEditorModalProps {
   onDeleteStoragePath: (path: string) => Promise<void>;
   onToggleArchive: (note: NoteDocument) => Promise<void>;
   onSoftDelete: (note: NoteDocument) => Promise<void>;
-  onImageClick: (url: string) => void;
+  onAttachmentClick: (target: PreviewTarget) => void;
+  onOpenSettings: () => void;
   onNotify: (msg: string) => void;
 }
 
 export const NoteEditorModal: React.FC<NoteEditorModalProps> = ({
   note,
   isDark,
+  storage,
+  firebaseApp,
   categories,
   tags,
   onClose,
   onSave,
+  onEnsureCategory,
   onUploadImage,
   onUploadFile,
   onDeleteStoragePath,
   onToggleArchive,
   onSoftDelete,
-  onImageClick,
+  onAttachmentClick,
+  onOpenSettings,
   onNotify,
 }) => {
   const [title, setTitle] = useState(note.title);
@@ -73,7 +92,10 @@ export const NoteEditorModal: React.FC<NoteEditorModalProps> = ({
   const [colorIndex, setColorIndex] = useState(note.colorIndex);
   const [category, setCategory] = useState(note.category || 'General');
   const [selectedTags, setSelectedTags] = useState<string[]>(() =>
-    note.tags ? note.tags.split('|').map((t) => t.trim()).filter(Boolean) : []
+    note.tags ? note.tags.split('|').map((t) => t.trim().replace(/^#/, '')).filter(Boolean) : []
+  );
+  const [autoTagsList, setAutoTagsList] = useState<string[]>(() =>
+    note.autoTags ? note.autoTags.split('|').map((t) => t.trim().replace(/^#/, '')).filter(Boolean) : []
   );
   const [webUrl, setWebUrl] = useState(note.webUrl || '');
   const [attachments, setAttachments] = useState<SyncAttachment[]>(note.attachments || []);
@@ -81,6 +103,12 @@ export const NoteEditorModal: React.FC<NoteEditorModalProps> = ({
   const [imageStoragePath, setImageStoragePath] = useState<string | null>(
     note.imageStoragePath
   );
+
+  // AI Analysis Bar (replicates Android editor AI curation)
+  const [showAiBar, setShowAiBar] = useState(false);
+  const [aiInput, setAiInput] = useState(note.webUrl || '');
+  const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [aiError, setAiError] = useState<string | null>(null);
 
   // Schedule state
   const [isScheduled, setIsScheduled] = useState(note.isScheduled);
@@ -111,6 +139,7 @@ export const NoteEditorModal: React.FC<NoteEditorModalProps> = ({
     colorIndex,
     category,
     tags: selectedTags.length > 0 ? selectedTags.join('|') : null,
+    autoTags: autoTagsList.length > 0 ? autoTagsList.join('|') : null,
     webUrl: webUrl.trim() ? webUrl.trim() : null,
     attachments,
     imageUrl,
@@ -123,11 +152,17 @@ export const NoteEditorModal: React.FC<NoteEditorModalProps> = ({
     updatedAt: Date.now(),
   };
 
-  const previewImages = getNoteImageUrls(draftNote);
+  const previewImages = getNoteImageEntries(draftNote);
   const previewFiles = getNoteFileAttachments(draftNote);
-  const autoTags = note.autoTags
-    ? note.autoTags.split('|').map((t) => t.trim()).filter(Boolean)
-    : [];
+
+  // Include note's active category in pills even if not yet pushed to preferences
+  const availableCategories = React.useMemo(() => {
+    const list = [...categories];
+    if (category && !list.some((c) => c.toLowerCase() === category.toLowerCase())) {
+      list.push(category);
+    }
+    return list;
+  }, [categories, category]);
 
   const handleSave = async () => {
     setIsSaving(true);
@@ -139,8 +174,53 @@ export const NoteEditorModal: React.FC<NoteEditorModalProps> = ({
     }
   };
 
+  const handleRunAiAnalysis = async () => {
+    setAiError(null);
+    setIsAnalyzing(true);
+    try {
+      const result = await analyzeWithAi(aiInput, {
+        existingTitle: title,
+        existingContent: content,
+        webUrl,
+      });
+
+      if (result.title) setTitle(result.title);
+      if (result.content) {
+        setIsTaskList(false);
+        setContent(result.content);
+      }
+      if (result.resolvedUrl) {
+        setWebUrl(result.resolvedUrl);
+      }
+      if (result.imageUrl) {
+        const existingUrls = imageUrl ? imageUrl.split('|').map((u) => u.trim()).filter(Boolean) : [];
+        if (!existingUrls.includes(result.imageUrl)) {
+          setImageUrl([...existingUrls, result.imageUrl].join('|'));
+        }
+      }
+      if (result.category) {
+        setCategory(result.category);
+        await onEnsureCategory(result.category);
+      }
+      if (result.tags) {
+        const parsedTags = result.tags
+          .split(/[|,]+/)
+          .map((t) => t.trim().replace(/^#/, ''))
+          .filter(Boolean);
+        setAutoTagsList(parsedTags);
+      }
+
+      setShowAiBar(false);
+      onNotify('AI Extraction Successful!');
+    } catch (err: unknown) {
+      setAiError(err instanceof Error ? err.message : 'AI analysis failed.');
+    } finally {
+      setIsAnalyzing(false);
+    }
+  };
+
   const handleImageFiles = async (fileList: File[]) => {
-    const validImages = fileList.filter((f) => f.type.startsWith('image/'));
+    const validImages = fileList.filter((f) => isImageFileOrAttachment(f.name, f.type, ''));
     if (validImages.length === 0) return;
     setIsUploading(true);
     let anyFallback = false;
@@ -197,22 +277,26 @@ export const NoteEditorModal: React.FC<NoteEditorModalProps> = ({
     e.preventDefault();
     setIsDraggingImage(false);
     const dropped = Array.from(e.dataTransfer?.files || []);
-    const images = dropped.filter((f) => f.type.startsWith('image/'));
+    const images = dropped.filter((f) => isImageFileOrAttachment(f.name, f.type, ''));
+    const otherFiles = dropped.filter((f) => !isImageFileOrAttachment(f.name, f.type, ''));
     if (images.length > 0) {
       void handleImageFiles(images);
     }
+    if (otherFiles.length > 0) {
+      void handleFileArrayUpload(otherFiles);
+    }
   };
 
-  const handleFileUpload = async (files: FileList | null) => {
-    if (!files || files.length === 0) return;
+  const handleFileArrayUpload = async (fileArr: File[]) => {
+    if (fileArr.length === 0) return;
     setIsUploading(true);
     try {
       const uploaded: SyncAttachment[] = [];
-      for (const file of Array.from(files)) {
+      for (const file of fileArr) {
         uploaded.push(await onUploadFile(note.noteId, file));
       }
       setAttachments((prev) => [...prev, ...uploaded]);
-      onNotify('File attached');
+      onNotify('File attached and synced');
     } catch (err: unknown) {
       onNotify(err instanceof Error ? err.message : 'File upload failed');
     } finally {
@@ -220,30 +304,56 @@ export const NoteEditorModal: React.FC<NoteEditorModalProps> = ({
     }
   };
 
-  const handleRemoveImage = async (targetUrl: string) => {
+  const handleFileUpload = async (files: FileList | null) => {
+    if (!files || files.length === 0) return;
+    await handleFileArrayUpload(Array.from(files));
+  };
+
+  const handleRemoveImage = async (entry: NoteImageEntry) => {
     const urls = imageUrl ? imageUrl.split('|').filter(Boolean) : [];
     const paths = imageStoragePath ? imageStoragePath.split('|').filter(Boolean) : [];
-    const idx = urls.indexOf(targetUrl);
-    if (idx !== -1) {
-      const removedPath = paths[idx];
-      if (removedPath) await onDeleteStoragePath(removedPath);
-      urls.splice(idx, 1);
-      if (idx < paths.length) paths.splice(idx, 1);
+
+    if (entry.url) {
+      const idx = urls.indexOf(entry.url);
+      if (idx !== -1) {
+        const removedPath = paths[idx];
+        if (removedPath) await onDeleteStoragePath(removedPath);
+        urls.splice(idx, 1);
+        if (idx < paths.length) paths.splice(idx, 1);
+      }
     }
 
-    const matchingAtt = attachments.find((a) => a.downloadUrl === targetUrl);
-    if (matchingAtt?.storagePath) {
-      await onDeleteStoragePath(matchingAtt.storagePath);
+    if (entry.storagePath) {
+      await onDeleteStoragePath(entry.storagePath);
+      const pIdx = paths.indexOf(entry.storagePath);
+      if (pIdx !== -1) paths.splice(pIdx, 1);
     }
 
-    setAttachments((prev) => prev.filter((a) => a.downloadUrl !== targetUrl));
+    setAttachments((prev) =>
+      prev.filter(
+        (a) =>
+          !(
+            (entry.url && a.downloadUrl === entry.url) ||
+            (entry.storagePath && a.storagePath === entry.storagePath)
+          )
+      )
+    );
     setImageUrl(urls.length > 0 ? urls.join('|') : null);
     setImageStoragePath(paths.length > 0 ? paths.join('|') : null);
   };
 
   const handleRemoveFile = async (att: SyncAttachment) => {
     if (att.storagePath) await onDeleteStoragePath(att.storagePath);
-    setAttachments((prev) => prev.filter((a) => a.downloadUrl !== att.downloadUrl));
+    setAttachments((prev) =>
+      prev.filter(
+        (a) =>
+          !(
+            a.downloadUrl === att.downloadUrl &&
+            a.storagePath === att.storagePath &&
+            a.fileName === att.fileName
+          )
+      )
+    );
   };
 
   const toggleTag = (tag: string) => {
@@ -307,6 +417,28 @@ export const NoteEditorModal: React.FC<NoteEditorModalProps> = ({
                   Checklist / Table
                 </>
               )}
+            </button>
+
+            <button
+              type="button"
+              onClick={() => {
+                setShowAiBar((v) => !v);
+                setAiError(null);
+              }}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-semibold border hover:bg-white/10 cursor-pointer"
+              style={
+                showAiBar
+                  ? {
+                      background: 'var(--accent-container)',
+                      color: 'var(--accent-container-text)',
+                      borderColor: 'transparent',
+                    }
+                  : { borderColor: 'var(--border-subtle)' }
+              }
+              title="Analyze URL or text with AI"
+            >
+              <Sparkles className="w-3.5 h-3.5" />
+              AI Analyze
             </button>
 
             <button
@@ -378,6 +510,85 @@ export const NoteEditorModal: React.FC<NoteEditorModalProps> = ({
 
         {/* Scrollable Editor Content */}
         <div className="flex-1 overflow-y-auto p-5 space-y-4">
+          {/* AI Extraction Input Area (matches Android NoteEditor AI bar) */}
+          {showAiBar && (
+            <div
+              className="rounded-2xl border p-3.5 space-y-2.5 bg-black/15"
+              style={{ borderColor: 'var(--border-subtle)' }}
+            >
+              <div className="flex items-center justify-between text-xs font-bold">
+                <span className="inline-flex items-center gap-1.5" style={{ color: 'var(--accent)' }}>
+                  <Sparkles className="w-3.5 h-3.5" />
+                  AI Curation &amp; Analysis
+                </span>
+                <button
+                  type="button"
+                  onClick={onOpenSettings}
+                  className="text-[11px] font-medium underline opacity-70 hover:opacity-100 cursor-pointer"
+                >
+                  API Key &amp; Prompt Settings
+                </button>
+              </div>
+
+              <div className="flex items-center gap-2">
+                <input
+                  type="text"
+                  value={aiInput}
+                  onChange={(e) => setAiInput(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      e.preventDefault();
+                      void handleRunAiAnalysis();
+                    }
+                  }}
+                  placeholder="Paste URL, game/movie/book name, or text to curate..."
+                  className="flex-1 rounded-xl px-3 py-2 text-xs border bg-black/20 focus:outline-none"
+                  style={{ borderColor: 'var(--border-subtle)' }}
+                />
+                <button
+                  type="button"
+                  disabled={isAnalyzing}
+                  onClick={() => void handleRunAiAnalysis()}
+                  className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-xs font-bold shrink-0 cursor-pointer disabled:opacity-60"
+                  style={{
+                    background: 'var(--accent)',
+                    color: 'var(--accent-on)',
+                  }}
+                >
+                  {isAnalyzing ? (
+                    <>
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                      Analyzing...
+                    </>
+                  ) : (
+                    <>
+                      <Sparkles className="w-3.5 h-3.5" />
+                      Curate
+                    </>
+                  )}
+                </button>
+              </div>
+
+              {aiError && (
+                <div className="flex items-start justify-between gap-2 rounded-xl px-3 py-2 text-xs bg-rose-500/15 text-rose-300 border border-rose-500/30">
+                  <span className="flex items-start gap-1.5">
+                    <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+                    <span>{aiError}</span>
+                  </span>
+                  {aiError.toLowerCase().includes('api key') && (
+                    <button
+                      type="button"
+                      onClick={onOpenSettings}
+                      className="underline font-semibold shrink-0 cursor-pointer"
+                    >
+                      Open Settings
+                    </button>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
+
           {/* Title */}
           <input
             type="text"
@@ -408,7 +619,7 @@ export const NoteEditorModal: React.FC<NoteEditorModalProps> = ({
               multiple
               className="hidden"
               onChange={(e) => {
-                handleImageUpload(e.target.files);
+                void handleImageUpload(e.target.files);
                 e.target.value = '';
               }}
             />
@@ -418,28 +629,39 @@ export const NoteEditorModal: React.FC<NoteEditorModalProps> = ({
               multiple
               className="hidden"
               onChange={(e) => {
-                handleFileUpload(e.target.files);
+                void handleFileUpload(e.target.files);
                 e.target.value = '';
               }}
             />
 
             {previewImages.length > 0 && (
               <div className="grid grid-cols-2 sm:grid-cols-3 gap-2.5">
-                {previewImages.map((url, idx) => (
+                {previewImages.map((entry, idx) => (
                   <div
-                    key={idx}
+                    key={`${entry.storagePath || entry.url || idx}`}
                     className="relative group rounded-2xl overflow-hidden border aspect-[4/3] bg-black/25"
                     style={{ borderColor: 'var(--border-subtle)' }}
                   >
-                    <img
-                      src={url}
-                      alt={`Attachment ${idx + 1}`}
-                      onClick={() => onImageClick(url)}
+                    <SmartNoteImage
+                      src={entry.url}
+                      storagePath={entry.storagePath}
+                      alt={entry.fileName || `Attachment ${idx + 1}`}
+                      storage={storage}
+                      firebaseApp={firebaseApp}
+                      isLocalOnlyUri={entry.isLocalOnlyUri}
                       className="w-full h-full object-cover cursor-zoom-in"
+                      onClick={(effectiveUrl) =>
+                        onAttachmentClick({
+                          fileName: entry.fileName || `Image ${idx + 1}`,
+                          mimeType: 'image/jpeg',
+                          downloadUrl: effectiveUrl,
+                          storagePath: entry.storagePath,
+                        })
+                      }
                     />
                     <button
                       type="button"
-                      onClick={() => handleRemoveImage(url)}
+                      onClick={() => void handleRemoveImage(entry)}
                       title="Remove image"
                       className="absolute top-1.5 right-1.5 p-1 rounded-full bg-black/70 text-white opacity-85 hover:opacity-100 cursor-pointer"
                     >
@@ -454,22 +676,46 @@ export const NoteEditorModal: React.FC<NoteEditorModalProps> = ({
               <div className="flex flex-wrap gap-2">
                 {previewFiles.map((att, idx) => (
                   <div
-                    key={idx}
+                    key={`${att.storagePath || att.downloadUrl || idx}`}
                     className="inline-flex items-center gap-2 px-3 py-1.5 rounded-xl text-xs border bg-black/20"
                     style={{ borderColor: 'var(--border-subtle)' }}
                   >
-                    <Paperclip className="w-3.5 h-3.5" />
-                    <a
-                      href={att.downloadUrl}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="underline max-w-[180px] truncate"
-                    >
-                      {att.fileName}
-                    </a>
                     <button
                       type="button"
-                      onClick={() => handleRemoveFile(att)}
+                      onClick={() =>
+                        onAttachmentClick({
+                          fileName: att.fileName,
+                          mimeType: att.mimeType,
+                          fileSize: att.fileSize,
+                          downloadUrl: att.downloadUrl,
+                          storagePath: att.storagePath,
+                        })
+                      }
+                      className="inline-flex items-center gap-1.5 hover:underline cursor-pointer"
+                      title="Preview attachment"
+                    >
+                      <Paperclip className="w-3.5 h-3.5 shrink-0" style={{ color: 'var(--accent)' }} />
+                      <span className="max-w-[160px] truncate font-medium">{att.fileName}</span>
+                      {att.fileSize > 0 && (
+                        <span className="opacity-55 text-[11px]">
+                          ({formatFileSize(att.fileSize)})
+                        </span>
+                      )}
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => void triggerAttachmentDownload(att, storage, firebaseApp)}
+                      title="Download file"
+                      className="opacity-70 hover:opacity-100 cursor-pointer"
+                    >
+                      <Download className="w-3.5 h-3.5" />
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => void handleRemoveFile(att)}
+                      title="Remove file"
                       className="opacity-65 hover:opacity-100 cursor-pointer"
                     >
                       <X className="w-3.5 h-3.5" />
@@ -528,7 +774,10 @@ export const NoteEditorModal: React.FC<NoteEditorModalProps> = ({
               style={{ borderColor: 'var(--border-subtle)' }}
             >
               <div className="flex items-center justify-between">
-                <span className="text-xs font-bold flex items-center gap-1.5" style={{ color: 'var(--accent)' }}>
+                <span
+                  className="text-xs font-bold flex items-center gap-1.5"
+                  style={{ color: 'var(--accent)' }}
+                >
                   <Clock className="w-3.5 h-3.5" />
                   Android Notification Schedule
                 </span>
@@ -552,15 +801,13 @@ export const NoteEditorModal: React.FC<NoteEditorModalProps> = ({
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
                   <div>
                     <label className="block text-[11px] opacity-65 mb-1">
-                      Trigger Date & Time
+                      Trigger Date &amp; Time
                     </label>
                     <input
                       type="datetime-local"
                       value={toDatetimeLocalValue(scheduledTime)}
                       onChange={(e) => {
-                        const ms = e.target.value
-                          ? new Date(e.target.value).getTime()
-                          : null;
+                        const ms = e.target.value ? new Date(e.target.value).getTime() : null;
                         setScheduledTime(ms);
                       }}
                       className="w-full rounded-xl px-2.5 py-1.5 text-xs border bg-black/20 focus:outline-none"
@@ -578,11 +825,21 @@ export const NoteEditorModal: React.FC<NoteEditorModalProps> = ({
                         className="flex-1 rounded-xl px-2.5 py-1.5 text-xs border bg-black/20 focus:outline-none"
                         style={{ borderColor: 'var(--border-subtle)' }}
                       >
-                        <option value="once" className="text-black">Once</option>
-                        <option value="minutes" className="text-black">Every N Minutes</option>
-                        <option value="daily" className="text-black">Daily</option>
-                        <option value="weekly" className="text-black">Weekly</option>
-                        <option value="monthly" className="text-black">Monthly</option>
+                        <option value="once" className="text-black">
+                          Once
+                        </option>
+                        <option value="minutes" className="text-black">
+                          Every N Minutes
+                        </option>
+                        <option value="daily" className="text-black">
+                          Daily
+                        </option>
+                        <option value="weekly" className="text-black">
+                          Weekly
+                        </option>
+                        <option value="monthly" className="text-black">
+                          Monthly
+                        </option>
                       </select>
                       {repeatFrequency === 'minutes' && (
                         <input
@@ -604,7 +861,10 @@ export const NoteEditorModal: React.FC<NoteEditorModalProps> = ({
           )}
 
           {/* Web URL */}
-          <div className="flex items-center gap-2 rounded-xl px-3 py-2 border bg-black/10" style={{ borderColor: 'var(--border-subtle)' }}>
+          <div
+            className="flex items-center gap-2 rounded-xl px-3 py-2 border bg-black/10"
+            style={{ borderColor: 'var(--border-subtle)' }}
+          >
             <Link2 className="w-4 h-4 opacity-60 shrink-0" />
             <input
               type="url"
@@ -630,14 +890,14 @@ export const NoteEditorModal: React.FC<NoteEditorModalProps> = ({
           <div className="space-y-2.5 pt-1">
             <div className="flex flex-wrap items-center gap-2">
               <span className="text-xs font-semibold opacity-65">Category:</span>
-              {categories.map((cat) => (
+              {availableCategories.map((cat) => (
                 <button
                   key={cat}
                   type="button"
                   onClick={() => setCategory(cat)}
                   className="px-2.5 py-1 rounded-full text-xs font-medium border transition-colors cursor-pointer"
                   style={
-                    category === cat
+                    category.toLowerCase() === cat.toLowerCase()
                       ? {
                           background: 'var(--accent)',
                           color: 'var(--accent-on)',
@@ -654,7 +914,7 @@ export const NoteEditorModal: React.FC<NoteEditorModalProps> = ({
             <div className="flex flex-wrap items-center gap-1.5">
               <span className="text-xs font-semibold opacity-65 mr-1">Tags:</span>
               {tags.map((t) => {
-                const active = selectedTags.includes(t);
+                const active = selectedTags.some((s) => s.toLowerCase() === t.toLowerCase());
                 return (
                   <button
                     key={t}
@@ -675,13 +935,23 @@ export const NoteEditorModal: React.FC<NoteEditorModalProps> = ({
                   </button>
                 );
               })}
-              {autoTags.map((t) => (
+              {autoTagsList.map((t) => (
                 <span
                   key={`auto-${t}`}
-                  className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs bg-black/20 opacity-80"
+                  className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs bg-black/20 opacity-85"
                 >
                   <Sparkles className="w-3 h-3" />
                   {t}
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setAutoTagsList((prev) => prev.filter((x) => x !== t))
+                    }
+                    title="Remove AI tag"
+                    className="ml-0.5 opacity-60 hover:opacity-100 cursor-pointer"
+                  >
+                    <X className="w-2.5 h-2.5" />
+                  </button>
                 </span>
               ))}
             </div>

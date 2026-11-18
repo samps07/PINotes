@@ -27,6 +27,8 @@ interface SidebarProps {
     scheduled: number;
     archive: number;
     trash: number;
+    categories?: Record<string, number>;
+    tags?: Record<string, number>;
   };
 }
 
@@ -51,10 +53,10 @@ export const Sidebar: React.FC<SidebarProps> = ({
   const isSelected = (sec: SidebarSection) => {
     if (sec.type !== activeSection.type) return false;
     if (sec.type === 'category' && activeSection.type === 'category') {
-      return sec.value === activeSection.value;
+      return sec.value.toLowerCase() === activeSection.value.toLowerCase();
     }
     if (sec.type === 'tag' && activeSection.type === 'tag') {
-      return sec.value === activeSection.value;
+      return sec.value.toLowerCase() === activeSection.value.toLowerCase();
     }
     return true;
   };
@@ -200,6 +202,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
 
         {categories.map((cat) => {
           const active = isSelected({ type: 'category', value: cat });
+          const count = counts.categories?.[cat.toLowerCase()] ?? 0;
           return (
             <div
               key={cat}
@@ -209,12 +212,17 @@ export const Sidebar: React.FC<SidebarProps> = ({
               <button
                 type="button"
                 onClick={() => handleSelect({ type: 'category', value: cat })}
-                className="flex-1 flex items-center gap-3 px-4 py-2 text-sm font-medium text-left truncate cursor-pointer"
+                className="flex-1 flex items-center justify-between gap-2 px-4 py-2 text-sm font-medium text-left truncate cursor-pointer"
               >
-                <Folder className="w-4 h-4 shrink-0" />
-                <span className="truncate">{cat}</span>
+                <span className="flex items-center gap-3 min-w-0">
+                  <Folder className="w-4 h-4 shrink-0" />
+                  <span className="truncate">{cat}</span>
+                </span>
+                {count > 0 && (
+                  <span className="text-xs opacity-60 shrink-0">{count}</span>
+                )}
               </button>
-              {cat !== 'General' && (
+              {cat.toLowerCase() !== 'general' && (
                 <button
                   type="button"
                   onClick={() => onDeleteCategory(cat)}
@@ -274,6 +282,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
 
         {tags.map((tag) => {
           const active = isSelected({ type: 'tag', value: tag });
+          const count = counts.tags?.[tag.toLowerCase()] ?? 0;
           return (
             <div
               key={tag}
@@ -283,10 +292,15 @@ export const Sidebar: React.FC<SidebarProps> = ({
               <button
                 type="button"
                 onClick={() => handleSelect({ type: 'tag', value: tag })}
-                className="flex-1 flex items-center gap-3 px-4 py-2 text-sm font-medium text-left truncate cursor-pointer"
+                className="flex-1 flex items-center justify-between gap-2 px-4 py-2 text-sm font-medium text-left truncate cursor-pointer"
               >
-                <Hash className="w-4 h-4 shrink-0" />
-                <span className="truncate">{tag}</span>
+                <span className="flex items-center gap-3 min-w-0">
+                  <Hash className="w-4 h-4 shrink-0" />
+                  <span className="truncate">{tag}</span>
+                </span>
+                {count > 0 && (
+                  <span className="text-xs opacity-60 shrink-0">{count}</span>
+                )}
               </button>
               <button
                 type="button"

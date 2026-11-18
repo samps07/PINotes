@@ -1,4 +1,6 @@
 import React, { useState } from 'react';
+import { FirebaseStorage } from 'firebase/storage';
+import { FirebaseApp } from 'firebase/app';
 import {
   Pin,
   Archive,
@@ -21,13 +23,21 @@ import {
   parseTableListData,
   toggleTaskItemChecked,
 } from '../utils/tableParser';
-import { getNoteFileAttachments, getNoteImageUrls } from '../services/notesService';
+import {
+  formatFileSize,
+  getNoteFileAttachments,
+  getNoteImageEntries,
+} from '../services/notesService';
+import { SmartNoteImage } from './SmartNoteImage';
+import { PreviewTarget } from './AttachmentPreviewModal';
 
 interface NoteCardProps {
   note: NoteDocument;
   isDark: boolean;
+  storage?: FirebaseStorage | null;
+  firebaseApp?: FirebaseApp | null;
   onOpen: () => void;
-  onImageClick: (url: string) => void;
+  onAttachmentClick: (target: PreviewTarget) => void;
   onTogglePin: () => void;
   onChangeColor: (colorIndex: number) => void;
   onToggleArchive: () => void;
@@ -41,8 +51,10 @@ interface NoteCardProps {
 export const NoteCard: React.FC<NoteCardProps> = ({
   note,
   isDark,
+  storage,
+  firebaseApp,
   onOpen,
-  onImageClick,
+  onAttachmentClick,
   onTogglePin,
   onChangeColor,
   onToggleArchive,
@@ -54,13 +66,13 @@ export const NoteCard: React.FC<NoteCardProps> = ({
 }) => {
   const [showColorMenu, setShowColorMenu] = useState(false);
   const colors = getNoteColors(note.colorIndex, isDark);
-  const images = getNoteImageUrls(note);
+  const imageEntries = getNoteImageEntries(note);
   const files = getNoteFileAttachments(note);
   const manualTags = note.tags
-    ? note.tags.split('|').map((t) => t.trim()).filter(Boolean)
+    ? note.tags.split('|').map((t) => t.trim().replace(/^#/, '')).filter(Boolean)
     : [];
   const autoTags = note.autoTags
-    ? note.autoTags.split('|').map((t) => t.trim()).filter(Boolean)
+    ? note.autoTags.split('|').map((t) => t.trim().replace(/^#/, '')).filter(Boolean)
     : [];
 
   const isTrashed = note.deletedAt !== null;
@@ -95,32 +107,51 @@ export const NoteCard: React.FC<NoteCardProps> = ({
       }}
     >
       {/* Image Gallery Preview */}
-      {images.length > 0 && (
+      {imageEntries.length > 0 && (
         <div
           className={`grid gap-1 p-1.5 pb-0 ${
-            images.length === 1 ? 'grid-cols-1' : 'grid-cols-2'
+            imageEntries.length === 1 ? 'grid-cols-1' : 'grid-cols-2'
           }`}
           onClick={(e) => e.stopPropagation()}
         >
-          {images.slice(0, 4).map((url, idx) => (
-            <button
-              key={idx}
-              type="button"
-              onClick={() => onImageClick(url)}
-              className="relative overflow-hidden rounded-xl bg-black/20 aspect-[16/10] cursor-zoom-in"
+          {imageEntries.slice(0, 4).map((entry, idx) => (
+            <div
+              key={`${entry.storagePath || entry.url || idx}`}
+              className="relative overflow-hidden rounded-xl bg-black/20 aspect-[16/10]"
             >
-              <img
-                src={url}
-                alt={`Attachment ${idx + 1}`}
-                loading="lazy"
-                className="w-full h-full object-cover transition-transform duration-200 hover:scale-105"
+              <SmartNoteImage
+                src={entry.url}
+                storagePath={entry.storagePath}
+                alt={entry.fileName || `Attachment ${idx + 1}`}
+                storage={storage}
+                firebaseApp={firebaseApp}
+                isLocalOnlyUri={entry.isLocalOnlyUri}
+                className="w-full h-full object-cover transition-transform duration-200 hover:scale-105 cursor-zoom-in"
+                onClick={(effectiveUrl) =>
+                  onAttachmentClick({
+                    fileName: entry.fileName || `Image ${idx + 1}`,
+                    mimeType: 'image/jpeg',
+                    downloadUrl: effectiveUrl,
+                    storagePath: entry.storagePath,
+                  })
+                }
               />
-              {idx === 3 && images.length > 4 && (
-                <div className="absolute inset-0 bg-black/60 flex items-center justify-center text-white text-sm font-bold">
-                  +{images.length - 4}
+              {idx === 3 && imageEntries.length > 4 && (
+                <div
+                  onClick={() =>
+                    onAttachmentClick({
+                      fileName: entry.fileName || 'Image 4',
+                      mimeType: 'image/jpeg',
+                      downloadUrl: entry.url,
+                      storagePath: entry.storagePath,
+                    })
+                  }
+                  className="absolute inset-0 bg-black/60 flex items-center justify-center text-white text-sm font-bold cursor-pointer"
+                >
+                  +{imageEntries.length - 4}
                 </div>
               )}
-            </button>
+            </div>
           ))}
         </div>
       )}
@@ -165,7 +196,10 @@ export const NoteCard: React.FC<NoteCardProps> = ({
             return (
               <div className="space-y-1.5 text-sm">
                 {isMultiCol && (
-                  <div className="flex items-center gap-2 text-[11px] font-bold uppercase tracking-wider opacity-65 pl-6 border-b pb-1" style={{ borderColor: 'var(--border-subtle)' }}>
+                  <div
+                    className="flex items-center gap-2 text-[11px] font-bold uppercase tracking-wider opacity-65 pl-6 border-b pb-1"
+                    style={{ borderColor: 'var(--border-subtle)' }}
+                  >
                     {table.headers.map((h, i) => (
                       <span key={i} className="flex-1 truncate">
                         {h}
@@ -239,20 +273,29 @@ export const NoteCard: React.FC<NoteCardProps> = ({
 
         {/* File Attachments */}
         {files.length > 0 && (
-          <div className="flex flex-wrap gap-1.5">
+          <div className="flex flex-wrap gap-1.5" onClick={(e) => e.stopPropagation()}>
             {files.map((att, idx) => (
-              <a
-                key={idx}
-                href={att.downloadUrl}
-                target="_blank"
-                rel="noopener noreferrer"
-                onClick={(e) => e.stopPropagation()}
-                className="inline-flex items-center gap-1 px-2 py-0.5 rounded-lg text-[11px] bg-black/20 hover:bg-black/30 border max-w-full"
+              <button
+                key={`${att.storagePath || att.downloadUrl || idx}`}
+                type="button"
+                onClick={() =>
+                  onAttachmentClick({
+                    fileName: att.fileName,
+                    mimeType: att.mimeType,
+                    fileSize: att.fileSize,
+                    downloadUrl: att.downloadUrl,
+                    storagePath: att.storagePath,
+                  })
+                }
+                className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-[11px] bg-black/20 hover:bg-black/30 border max-w-full cursor-pointer"
                 style={{ borderColor: 'var(--border-subtle)' }}
               >
-                <Paperclip className="w-3 h-3 shrink-0" />
-                <span className="truncate max-w-[150px]">{att.fileName}</span>
-              </a>
+                <Paperclip className="w-3 h-3 shrink-0" style={{ color: 'var(--accent)' }} />
+                <span className="truncate max-w-[140px]">{att.fileName}</span>
+                {att.fileSize > 0 && (
+                  <span className="opacity-55 shrink-0">{formatFileSize(att.fileSize)}</span>
+                )}
+              </button>
             ))}
           </div>
         )}
@@ -292,7 +335,10 @@ export const NoteCard: React.FC<NoteCardProps> = ({
 
         {/* Scheduled Notification Tag */}
         {note.isScheduled && note.scheduledTime && (
-          <div className="flex items-center gap-1.5 text-[11px] font-semibold pt-0.5" style={{ color: 'var(--accent)' }}>
+          <div
+            className="flex items-center gap-1.5 text-[11px] font-semibold pt-0.5"
+            style={{ color: 'var(--accent)' }}
+          >
             <Clock className="w-3.5 h-3.5 shrink-0" />
             <span className="truncate">
               Upcoming: {formatScheduleTime(note.scheduledTime)}

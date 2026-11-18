@@ -21,6 +21,7 @@ export const RichTextEditor: React.FC<RichTextEditorProps> = ({
   minHeight = '140px',
 }) => {
   const editorRef = useRef<HTMLDivElement>(null);
+  const lastSerializedRef = useRef<string>(initialValue);
   const [activeFormats, setActiveFormats] = useState({
     bold: false,
     italic: false,
@@ -30,13 +31,23 @@ export const RichTextEditor: React.FC<RichTextEditorProps> = ({
   useEffect(() => {
     if (editorRef.current) {
       editorRef.current.innerHTML = parseAndroidRichTextToSafeHtml(initialValue);
+      lastSerializedRef.current = initialValue;
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  useEffect(() => {
+    if (editorRef.current && initialValue !== lastSerializedRef.current) {
+      editorRef.current.innerHTML = parseAndroidRichTextToSafeHtml(initialValue);
+      lastSerializedRef.current = initialValue;
+    }
+  }, [initialValue]);
+
   const syncValue = () => {
     if (!editorRef.current) return;
-    onChange(serializeElementToAndroidRichText(editorRef.current));
+    const serialized = serializeElementToAndroidRichText(editorRef.current);
+    lastSerializedRef.current = serialized;
+    onChange(serialized);
     refreshToolbarState();
   };
 
